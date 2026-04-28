@@ -1,0 +1,32 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+checkpoints/
+wandb/
+*.pt
+*.pth
+.DS_Store
+
+# Data and Models
+data/
+data_wan/
+*.safetensors
+
+# Evaluation & Outputs
+eval_outputs/
+eval_outputs_gate1/
+*.mp4
+*.gif
+
+# Third Party / Submodules
+DiffSynth-Studio/
+
+# Logs
+*.log
