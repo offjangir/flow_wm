@@ -654,6 +654,7 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
         last_image: Optional[torch.Tensor] = None,
         render_video: Optional[Any] = None,
         render_latents: Optional[torch.Tensor] = None,
+        drop_render_conditioning: bool = False,
         output_type: Optional[str] = "np",
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -668,9 +669,10 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
                 "RenderConditionedWanI2VPipeline supports Wan 2.1-style I2V only "
                 "(single transformer, expand_timesteps=False, boundary_ratio=None)."
             )
-        if render_latents is None and render_video is None:
+        if not drop_render_conditioning and render_latents is None and render_video is None:
             raise ValueError(
-                "Pass `render_latents` (B, C, T_lat, H_lat, W_lat) or `render_video` (PIL/ndarray frames)."
+                "Pass `render_latents` (B, C, T_lat, H_lat, W_lat) or `render_video` (PIL/ndarray frames), "
+                "or set `drop_render_conditioning=True` for vanilla I2V (no render branch)."
             )
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
@@ -697,19 +699,22 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
         eff_bs = batch_size * num_videos_per_prompt
         transformer_dtype = self.transformer.dtype
 
-        if render_latents is None:
+        if drop_render_conditioning:
+            render_latents = None
+        elif render_latents is None:
             render_latents = self._encode_render_video(
                 render_video, height, width, num_frames, device, transformer_dtype
             )
         else:
             render_latents = render_latents.to(device=device, dtype=transformer_dtype)
 
-        if render_latents.shape[0] == 1 and eff_bs > 1:
-            render_latents = render_latents.expand(eff_bs, -1, -1, -1, -1)
-        elif render_latents.shape[0] != eff_bs:
-            raise ValueError(
-                f"render_latents batch {render_latents.shape[0]} != batch_size*num_videos_per_prompt={eff_bs}"
-            )
+        if render_latents is not None:
+            if render_latents.shape[0] == 1 and eff_bs > 1:
+                render_latents = render_latents.expand(eff_bs, -1, -1, -1, -1)
+            elif render_latents.shape[0] != eff_bs:
+                raise ValueError(
+                    f"render_latents batch {render_latents.shape[0]} != batch_size*num_videos_per_prompt={eff_bs}"
+                )
 
         self.check_inputs(
             prompt,

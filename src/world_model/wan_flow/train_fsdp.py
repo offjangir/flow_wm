@@ -1,3 +1,4 @@
+
 """
 Multi-GPU FSDP training for render-conditioned Wan 2.1 I2V.
 
@@ -107,7 +108,6 @@ def parse_args() -> argparse.Namespace:
         description="Multi-GPU FSDP training for render-conditioned Wan 2.1 I2V.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.set_defaults(**{k: v for k, v in defaults.items() if k != "config"})
     p.add_argument("--config", type=str, default=None)
     p.add_argument("--model_path", type=str, required=False)
     p.add_argument("--dataset_base_path", type=str, required=False)
@@ -211,6 +211,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, pass render_latents=None to the model to run vanilla I2V DiT behavior.",
     )
+    p.set_defaults(**{k: v for k, v in defaults.items() if k != "config"})
     args = p.parse_args(remaining)
     if not args.model_path or not args.dataset_base_path or not args.metadata_csv:
         p.error("Provide --model_path, --dataset_base_path, and --metadata_csv (via CLI or --config JSON).")
@@ -248,7 +249,7 @@ def main() -> None:
     # the model's native (bf16) dtype, so we don't lose any speed.
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision="no",
+        mixed_precision=args.mixed_precision,
         log_with=None,
     )
     args = _setup_run_dir_and_logging(args, accelerator)
@@ -902,7 +903,7 @@ def main() -> None:
                         keep_prefixes.append("tracks_head.")
                     if getattr(args, "unfreeze_last_n_blocks", 0) > 0:
                         n_blocks = args.unfreeze_last_n_blocks
-                        for i in range(len(dit.blocks) - n_blocks, len(dit.blocks)):
+                        for i in range(len(accelerator.unwrap_model(dit).blocks) - n_blocks, len(accelerator.unwrap_model(dit).blocks)):
                             keep_prefixes.append(f"blocks.{i}.")
                         keep_prefixes.append("norm_out.")
                         keep_prefixes.append("proj_out.")
