@@ -1,0 +1,19 @@
+{
+  "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+  "dataset_base_path": "./examples/dataset",
+  "metadata_csv": "./examples/dataset/metadata.csv",
+  "output_dir": "./checkpoints/wan_render",
+  "num_frames": 81,
+  "height": 480,
+  "width": 832,
+  "dataset_repeat": 1,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.01,
+  "num_epochs": 1,
+  "gradient_accumulation_steps": 1,
+  "seed": 42,
+  "trainable": "render_only",
+  "max_sequence_length": 512,
+  "mixed_precision": "bf16",
+  "num_workers": 2
+}

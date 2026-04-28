@@ -1,0 +1,31 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  # Shard parameters + gradients + optimizer states across GPUs
+  fsdp_sharding_strategy: FULL_SHARD
+  # Auto-wrap transformer blocks so each block is an FSDP unit
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  # The repeated block class inside the Wan DiT
+  fsdp_transformer_layer_cls_to_wrap: WanTransformerBlock
+  # Offload params to CPU when not in use (set false if enough GPU mem)
+  fsdp_offload_params: true
+  
+  # Keep parameters in bf16 during FSDP communication
+  fsdp_forward_prefetch: true
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_state_dict_type: FULL_STATE_DICT
+# IMPORTANT: keep this 'no'. With `mixed_precision: bf16`, Accelerate upcasts
+# every floating param to fp32 BEFORE FSDP wraps the model, so a 16B-param
+# Wan DiT in bf16 silently doubles to 32B fp32 master weights and the sharded
+# storage jumps from ~8 GB/rank to ~16 GB/rank. The compute is still bf16
+# either way (we cast the DiT to bf16 manually in train_fsdp.py via
+# `_cast_module_for_fsdp`), so we lose nothing on speed and gain ~8 GB/rank.
+mixed_precision: 'no'
+# Set num_processes to match your GPU count, or override via CLI:
+#   accelerate launch --num_processes <N> --config_file configs/accelerate_fsdp.yaml ...
+num_machines: 1
+num_processes: 4
+main_training_function: main

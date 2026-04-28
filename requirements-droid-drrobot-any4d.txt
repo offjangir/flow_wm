@@ -1,0 +1,61 @@
+# =============================================================================
+# DROID → DrRobot → Any4D pipeline (droid_drrobot_any4d_pipeline.py)
+# =============================================================================
+#
+# Use Python 3.10+ (matches DrRobot / Any4D testing).
+#
+# Conda (recommended — install CUDA PyTorch first, then this file):
+#   conda create -n droid-any4d python=3.10 -y
+#   conda activate droid-any4d
+#   conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
+#   pip install -r requirements-droid-drrobot-any4d.txt
+#
+# Any4D’s pyproject pins torch~=2.6; align your conda/pip torch build with that
+# (or relax the pin in Any4D if you know your stack is compatible).
+#
+# Register Any4D in the env without re-pulling torch (keeps conda CUDA wheels):
+#   pip install -e ./Any4D --no-deps
+#
+# DrRobot is used by path (--drrobot_root). This repo keeps a copy under
+# wm/drrobot; the pipeline defaults to ./drrobot next to the script — symlink,
+# copy, or pass --drrobot_root /path/to/drrobot.
+#
+# Headless rendering:
+#   export MUJOCO_GL=egl
+# =============================================================================
+
+# --- droid_drrobot_any4d_pipeline.py (direct) ---
+h5py>=3.8
+scipy>=1.10
+
+# --- DrRobot (wm/drrobot/README.md) ---
+gsplat
+filelock
+mujoco
+open3d
+pytorch-kinematics
+random-fourier-features-pytorch
+pytz
+gradio
+ray
+
+# --- Any4D (Any4D/pyproject.toml; torch stack omitted — install via conda) ---
+huggingface_hub
+hydra-core
+natsort
+opencv-python-headless==4.10.0.84
+orjson
+pillow-heif
+plyfile
+python-box
+safetensors
+tensorboard
+tqdm
+rerun-sdk>=0.23,<0.24
+trimesh
+matplotlib
+einops
+uniception @ git+https://github.com/JayKarhade/UniCeption.git@dev/any4d
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3913c65d81e05e47b9f367250cf8c0f7462a0900
+
+# Optional: wm/extract_any4d_flow.py uses the same stack; no extra pins.
