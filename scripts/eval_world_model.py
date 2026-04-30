@@ -386,6 +386,8 @@ def main() -> None:
         print(f"        video  = {vpath}")
         print(f"        render = {rpath}")
         print(f"        prompt = {prompt!r}")
+        if hasattr(pipe.transformer, "render_gate"):
+            print(f"        render_gate = {float(pipe.transformer.render_gate.item()):.6f}")
 
         gt_frames = _resize_pils(_load_video_frames(vpath, args.num_frames), args.height, args.width)
         render_frames = _resize_pils(_load_video_frames(rpath, args.num_frames), args.height, args.width)
@@ -454,6 +456,7 @@ def main() -> None:
             "scene": scene,
             "elapsed_s": round(elapsed, 2),
             "out_path": out_path,
+            "render_gate": float(pipe.transformer.render_gate.item()) if hasattr(pipe.transformer, "render_gate") else None,
         })
 
     summary_path = os.path.join(args.output_dir, "eval_summary.json")

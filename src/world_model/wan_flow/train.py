@@ -121,22 +121,26 @@ def condition_usage_sanity(
         latent_in = torch.cat([noisy, cond], dim=1)
         target = noise - clean
 
-        pred_right = model(
-            hidden_states=latent_in,
-            timestep=t_batch,
-            encoder_hidden_states=prompt,
-            encoder_hidden_states_image=image,
-            render_latents=rr,
-            return_dict=False,
-        )[0]
-        pred_wrong = model(
-            hidden_states=latent_in,
-            timestep=t_batch,
-            encoder_hidden_states=prompt,
-            encoder_hidden_states_image=image,
-            render_latents=rw,
-            return_dict=False,
-        )[0]
+        # Force the unwrapped model to the correct dtype and use autocast
+        # to handle any mixed-precision modules (e.g. time_proj in fp32).
+        model.to(dtype=dtype)
+        with torch.amp.autocast(device_type=device.type, dtype=dtype):
+            pred_right = model(
+                hidden_states=latent_in,
+                timestep=t_batch,
+                encoder_hidden_states=prompt,
+                encoder_hidden_states_image=image,
+                render_latents=rr,
+                return_dict=False,
+            )[0]
+            pred_wrong = model(
+                hidden_states=latent_in,
+                timestep=t_batch,
+                encoder_hidden_states=prompt,
+                encoder_hidden_states_image=image,
+                render_latents=rw,
+                return_dict=False,
+            )[0]
         l_right = float(F.mse_loss(pred_right[:, :, 1:].float(), target[:, :, 1:].float()))
         l_wrong = float(F.mse_loss(pred_wrong[:, :, 1:].float(), target[:, :, 1:].float()))
         right_losses.append(l_right)

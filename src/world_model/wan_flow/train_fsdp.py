@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator, DistributedType
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from accelerate.utils import set_seed
 from tqdm.auto import tqdm
 
@@ -798,6 +799,7 @@ def main() -> None:
                         flow=f"{float(flow_g):.3f}",
                         ema=f"{flow_ema:.3f}",
                         sig=f"{sigma_frac:.2f}",
+                        gate=f"{float(accelerator.unwrap_model(dit).render_gate.item()):.4f}",
                         tr=f"{float(tracks_g):.3f}" if pred_tracks is not None else "off",
                         gn=f"{gn_disp:.3f}",
                         ok="Y" if loss_is_finite else "N",
@@ -818,6 +820,7 @@ def main() -> None:
                             "train/timestep_sigma_frac": sigma_frac,
                             "train/epoch": epoch,
                             "train/elapsed_s": elapsed,
+                            "train/render_gate": float(accelerator.unwrap_model(dit).render_gate.item()),
                         }
                         # Per-quartile (by timestep) running-average flow loss.
                         # The "mid" buckets (Q1, Q2) are the hardest and are
@@ -855,36 +858,39 @@ def main() -> None:
             or epoch == args.num_epochs - 1
         )
         if should_save:
-            if (
-                accelerator.is_main_process
-                and int(args.condition_usage_sanity_samples) > 0
-                and not getattr(args, "drop_render_conditioning", False)
-            ):
-                stats = condition_usage_sanity(
-                    accelerator.unwrap_model(dit),
-                    embed_cache,
-                    scheduler,
-                    device,
-                    dtype,
-                    int(args.condition_usage_sanity_samples),
-                    int(args.seed) + int(epoch),
-                )
-                if stats is not None:
-                    accelerator.print(
-                        "[sanity] condition usage: "
-                        f"right={stats['loss_right']:.4f}  wrong={stats['loss_wrong']:.4f}  "
-                        f"gap={stats['loss_gap']:+.4f} ({100.0*stats['loss_gap_ratio']:+.1f}%)  "
-                        f"wrong>right={100.0*stats['wrong_higher_frac']:.1f}% over {int(stats['samples'])} samples"
+            # FSDP.summon_full_params is a collective call: all ranks must enter.
+            # rank0_only=True ensures only rank 0 actually populates the gathered weights.
+            with FSDP.summon_full_params(dit, writeback=False, recurse=True, rank0_only=True):
+                if (
+                    accelerator.is_main_process
+                    and int(args.condition_usage_sanity_samples) > 0
+                    and not getattr(args, "drop_render_conditioning", False)
+                ):
+                    stats = condition_usage_sanity(
+                        accelerator.unwrap_model(dit),
+                        embed_cache,
+                        scheduler,
+                        device,
+                        dtype,
+                        int(args.condition_usage_sanity_samples),
+                        int(args.seed) + int(epoch),
                     )
-                    if use_wandb:
-                        import wandb
-                        wandb.log({
-                            "sanity/cond_loss_right": stats["loss_right"],
-                            "sanity/cond_loss_wrong": stats["loss_wrong"],
-                            "sanity/cond_loss_gap": stats["loss_gap"],
-                            "sanity/cond_loss_gap_ratio": stats["loss_gap_ratio"],
-                            "sanity/cond_wrong_higher_frac": stats["wrong_higher_frac"],
-                        }, step=global_step)
+                    if stats is not None:
+                        accelerator.print(
+                            "[sanity] condition usage: "
+                            f"right={stats['loss_right']:.4f}  wrong={stats['loss_wrong']:.4f}  "
+                            f"gap={stats['loss_gap']:+.4f} ({100.0*stats['loss_gap_ratio']:+.1f}%)  "
+                            f"wrong>right={100.0*stats['wrong_higher_frac']:.1f}% over {int(stats['samples'])} samples"
+                        )
+                        if use_wandb:
+                            import wandb
+                            wandb.log({
+                                "sanity/cond_loss_right": stats["loss_right"],
+                                "sanity/cond_loss_wrong": stats["loss_wrong"],
+                                "sanity/cond_loss_gap": stats["loss_gap"],
+                                "sanity/cond_loss_gap_ratio": stats["loss_gap_ratio"],
+                                "sanity/cond_wrong_higher_frac": stats["wrong_higher_frac"],
+                            }, step=global_step)
 
             accelerator.wait_for_everyone()
             save_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
