@@ -1,0 +1,43 @@
+# Heavy / generated data — never commit
+data/
+output/
+renders_out/
+tmp/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Model checkpoints, point clouds, sample-camera pickles
+*.pth
+*.ply
+*.pkl
+
+# Numpy / video / hdf5 / svo blobs
+*.npy
+*.npz
+*.mp4
+*.mkv
+*.avi
+*.h5
+*.hdf5
+*.svo
+
+# Vendored meshes (re-fetchable from upstream MuJoCo Menagerie / robot_descriptions)
+*.obj
+*.stl
+*.dae
+
+# Native build artefacts
+*.so
+*.o
+*.a
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -121,9 +121,11 @@ def condition_usage_sanity(
         latent_in = torch.cat([noisy, cond], dim=1)
         target = noise - clean
 
-        # Force the unwrapped model to the correct dtype and use autocast
-        # to handle any mixed-precision modules (e.g. time_proj in fp32).
-        model.to(dtype=dtype)
+        # Use autocast to handle any mixed-precision modules (e.g. time_proj
+        # in fp32). Note: do NOT call ``model.to(dtype=...)`` here -- that
+        # mutates the model storage dtype mid-training, and this probe is
+        # run between training epochs. The autocast wrapper is sufficient
+        # for forward consistency.
         with torch.amp.autocast(device_type=device.type, dtype=dtype):
             pred_right = model(
                 hidden_states=latent_in,
@@ -724,6 +726,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, force render_gate=1.0 and freeze it (no attenuation, no gate learning).",
     )
+    p.add_argument(
+        "--ignore_prompts",
+        action="store_true",
+        help="If set, use empty string for all text prompts during precompute.",
+    )
+    p.add_argument(
+        "--render_dropout_prob",
+        type=float,
+        default=0.0,
+        help="Per-step probability of dropping the render condition during training "
+             "(render_latents=None). Required for inference-time CFG-on-render to be "
+             "meaningful: with prob=0 the model never sees a no-render input and the "
+             "unconditional CFG branch is out-of-distribution. 0.1 is a standard value.",
+    )
+    p.add_argument(
+        "--use_embodiment_adapter",
+        action="store_true",
+        help="If set, replace the legacy pooled-vector render encoder + scalar gate "
+             "(EgoWM Eq. 5) with the EmbodimentAgnosticConditioning module: spatial KV "
+             "bank + per-block cross-attn adapters + decoupled AdaLN deltas. Identity "
+             "at init. See ARCHITECTURE_REVIEW.md §4.1.",
+    )
     if defaults:
         p.set_defaults(**{k: v for k, v in defaults.items() if k != "config"})
     args = p.parse_args(remaining)
@@ -732,9 +756,55 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+_PRECOMPUTE_CACHE_VERSION = 1
+
+
+def _compute_precompute_key(
+    *, model_path, rows, base_path, num_frames, height, width,
+    max_seq_len, ignore_prompts, has_tracks,
+) -> str:
+    """Stable hash of every input that affects ``_precompute_embeddings`` output.
+
+    Includes the dataset's video / render / tracks paths AND their on-disk
+    sizes + mtimes — re-encoding a render or swapping the metadata csv
+    invalidates the cache automatically.
+    """
+    import hashlib, json, os
+    h = hashlib.blake2b(digest_size=16)
+    h.update(json.dumps({
+        "version": _PRECOMPUTE_CACHE_VERSION,
+        "model_path": str(model_path),
+        "num_frames": int(num_frames),
+        "height": int(height),
+        "width": int(width),
+        "max_seq_len": int(max_seq_len),
+        "ignore_prompts": bool(ignore_prompts),
+        "has_tracks": bool(has_tracks),
+        "n_rows": len(rows),
+    }, sort_keys=True).encode())
+
+    def _stat(p_rel: str) -> tuple:
+        if not p_rel:
+            return (None, 0, 0.0)
+        p = p_rel if os.path.isabs(p_rel) else os.path.join(base_path, p_rel)
+        try:
+            st = os.stat(p)
+            return (p, st.st_size, st.st_mtime)
+        except OSError:
+            return (p, -1, -1.0)
+
+    for r in rows:
+        for col in ("video", "render", "tracks"):
+            h.update(json.dumps([col, _stat(r.get(col, ""))], default=str).encode())
+        h.update(("\n" + str(r.get("prompt", ""))).encode("utf-8", errors="replace"))
+    return h.hexdigest()
+
+
 def _precompute_embeddings(
     model_path, dataset, device, height, width, num_frames, max_seq_len,
     encoder_dtype: torch.dtype = torch.bfloat16,
+    ignore_prompts: bool = False,
+    cache_path=None,
 ):
     """
     Load each encoder **directly to GPU** one at a time via ``device_map``.
@@ -749,8 +819,14 @@ def _precompute_embeddings(
       - ``condition``: Wan I2V (mask + first-frame-VAE) 20-channel condition tensor
       - ``gt_xy`` (optional): tracks (num_frames, N, 2) in [-1, 1] (if dataset has tracks)
       - ``gt_vis`` (optional): visibility (num_frames, N) in {0, 1}
+
+    If ``cache_path`` is given and a cache file exists with a matching key
+    (model + dataset + resolution + prompts), it is loaded from disk in seconds
+    instead of re-running encoders. On a miss, the freshly-computed cache is
+    saved to ``cache_path`` for the next launch.
     """
-    import gc
+    import gc, os
+    from pathlib import Path
     from diffusers import FlowMatchEulerDiscreteScheduler
     from diffusers.video_processor import VideoProcessor
     from transformers import AutoImageProcessor, AutoTokenizer, CLIPVisionModel, UMT5EncoderModel
@@ -761,6 +837,33 @@ def _precompute_embeddings(
     rows = dataset.rows
     n = len(rows)
     dev_str = str(device)
+
+    # ── Cache: short-circuit if a valid on-disk cache exists ───────────────
+    cache_key = None
+    cache_path = Path(cache_path) if cache_path else None
+    if cache_path is not None:
+        cache_key = _compute_precompute_key(
+            model_path=root, rows=rows, base_path=dataset.base_path,
+            num_frames=num_frames, height=height, width=width,
+            max_seq_len=max_seq_len, ignore_prompts=ignore_prompts,
+            has_tracks=dataset.has_tracks,
+        )
+        if cache_path.is_file():
+            print(f"[precompute] checking on-disk cache: {cache_path}")
+            try:
+                blob = torch.load(cache_path, map_location="cpu", weights_only=False)
+                if blob.get("key") == cache_key:
+                    print(
+                        f"[precompute] HIT  ({len(blob['cache'])} samples, "
+                        f"{cache_path.stat().st_size / 1e9:.2f} GB)  → skipping encoders"
+                    )
+                    return blob["cache"], blob["z_dim"], blob["scheduler"]
+                print(
+                    f"[precompute] MISS — cache key changed "
+                    f"(stored={blob.get('key','?')[:16]}…  expected={cache_key[:16]}…)"
+                )
+            except Exception as exc:
+                print(f"[precompute] cache load failed ({exc}); recomputing")
 
     def _load_target(row):
         vpath = row["video"]
@@ -787,8 +890,9 @@ def _precompute_embeddings(
     all_prompt_embeds = []
     with torch.no_grad():
         for i, row in enumerate(rows):
+            p_text = "" if ignore_prompts else str(row["prompt"])
             tok = tokenizer(
-                [str(row["prompt"])],
+                [p_text],
                 padding="max_length", max_length=max_seq_len,
                 truncation=True, add_special_tokens=True,
                 return_attention_mask=True, return_tensors="pt",
@@ -887,7 +991,12 @@ def _precompute_embeddings(
                 all_tracks.append(None)
                 continue
             tpath = t if os.path.isabs(t) else os.path.join(dataset.base_path, t)
-            trajs, visibs, _img = _load_tracks_npz(tpath, num_frames)
+            # Re-project tracks into the training canvas (height, width) so they
+            # stay aligned with the resized target video. See _load_tracks_npz.
+            trajs, visibs, _img = _load_tracks_npz(
+                tpath, num_frames,
+                target_height=height, target_width=width,
+            )
             all_tracks.append({"gt_xy": trajs, "gt_vis": visibs})
         n_with = sum(1 for t in all_tracks if t is not None)
         print(f"[precompute tracks] {n_with}/{n} samples have tracks")
@@ -907,6 +1016,27 @@ def _precompute_embeddings(
             sample["gt_xy"] = all_tracks[i]["gt_xy"]
             sample["gt_vis"] = all_tracks[i]["gt_vis"]
         cache.append(sample)
+
+    if cache_path is not None and cache_key is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            torch.save(
+                {"key": cache_key, "cache": cache, "z_dim": z_dim, "scheduler": scheduler,
+                 "version": _PRECOMPUTE_CACHE_VERSION},
+                tmp,
+            )
+            os.replace(tmp, cache_path)
+            print(
+                f"[precompute] saved cache → {cache_path} "
+                f"({cache_path.stat().st_size / 1e9:.2f} GB, key={cache_key[:16]}…)"
+            )
+        except Exception as exc:
+            print(f"[precompute] WARN: failed to write cache to {cache_path}: {exc}")
+            if tmp.exists():
+                try: tmp.unlink()
+                except OSError: pass
+
     return cache, z_dim, scheduler
 
 
@@ -1003,13 +1133,25 @@ def main() -> None:
     # Load DiT in the user-selected mixed-precision dtype (or bf16 fallback for fp32
     # to keep weight memory bounded on consumer GPUs; Accelerator will autocast).
     dit_load_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
-    tkw = dict(torch_dtype=dit_load_dtype, render_encoder_kwargs={})
+    tkw = dict(
+        torch_dtype=dit_load_dtype,
+        render_encoder_kwargs={},
+        use_embodiment_adapter=bool(args.use_embodiment_adapter),
+    )
     if local_transformer:
         dit = WanTransformerRenderConditioned.from_pretrained(os.path.join(root, "transformer"), **tkw)
     else:
         dit = WanTransformerRenderConditioned.from_pretrained(root, subfolder="transformer", **tkw)
 
     _materialize_meta_submodules(dit)
+    # Re-apply identity-at-init zero-inits that ``reset_parameters`` wiped during
+    # meta materialization (DecoupledAdaLNHead.up, MultiheadAttention.out_proj, ...).
+    if hasattr(dit, "reset_zero_gates"):
+        dit.reset_zero_gates()
+    accelerator.print(
+        f"[train] conditioning path: "
+        f"{'embodiment_adapter' if args.use_embodiment_adapter else 'legacy_egowm_eq5'}"
+    )
     dit = dit.to(device)
     gc.collect()
     torch.cuda.empty_cache()
@@ -1021,11 +1163,15 @@ def main() -> None:
     if args.trainable == "render_only":
         for p_ in dit.parameters():
             p_.requires_grad = False
-        for p_ in dit.render_encoder.parameters():
-            p_.requires_grad = True
-        for p_ in dit.render_fuse.parameters():
-            p_.requires_grad = True
-        dit.render_gate.requires_grad = True
+        if args.use_embodiment_adapter:
+            for p_ in dit.embodiment.parameters():
+                p_.requires_grad = True
+        else:
+            for p_ in dit.render_encoder.parameters():
+                p_.requires_grad = True
+            for p_ in dit.render_fuse.parameters():
+                p_.requires_grad = True
+            dit.render_gate.requires_grad = True
         if use_tracks_loss:
             for p_ in dit.tracks_head.parameters():
                 p_.requires_grad = True
@@ -1034,20 +1180,44 @@ def main() -> None:
             p_.requires_grad = True
 
     if args.disable_render_gate:
-        with torch.no_grad():
-            dit.render_gate.data.fill_(1.0)
-        dit.render_gate.requires_grad = False
+        if args.use_embodiment_adapter:
+            with torch.no_grad():
+                dit.embodiment.render_adaln_gate.data.fill_(1.0)
+                dit.embodiment.state_adaln_gate.data.fill_(1.0)
+                for adapter in dit.embodiment.adapters.values():
+                    adapter.gate.data.fill_(1.0)
+            dit.embodiment.render_adaln_gate.requires_grad = False
+            dit.embodiment.state_adaln_gate.requires_grad = False
+            for adapter in dit.embodiment.adapters.values():
+                adapter.gate.requires_grad = False
+        else:
+            with torch.no_grad():
+                dit.render_gate.data.fill_(1.0)
+            dit.render_gate.requires_grad = False
 
     trainable = [p for p in dit.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in dit.parameters())
     n_th = sum(p.numel() for p in dit.tracks_head.parameters())
-    accelerator.print(
-        f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
-        f"({100*n_trainable/n_total:.2f}%); tracks_head: {n_th/1e6:.2f}M  "
-        f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}  "
-        f"disable_render_gate={args.disable_render_gate}  render_gate={float(dit.render_gate.detach().float().item()):.4g}"
-    )
+    if args.use_embodiment_adapter:
+        n_emb = sum(p.numel() for p in dit.embodiment.parameters())
+        gate_str = (
+            f"render_adaln_gate={float(dit.embodiment.render_adaln_gate.float().item()):.4g} "
+            f"state_adaln_gate={float(dit.embodiment.state_adaln_gate.float().item()):.4g}"
+        )
+        accelerator.print(
+            f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
+            f"({100*n_trainable/n_total:.2f}%); embodiment={n_emb/1e6:.2f}M; "
+            f"tracks_head: {n_th/1e6:.2f}M  lambda_tracks={args.lambda_tracks}  "
+            f"use_tracks_loss={use_tracks_loss}  disable_render_gate={args.disable_render_gate}  {gate_str}"
+        )
+    else:
+        accelerator.print(
+            f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
+            f"({100*n_trainable/n_total:.2f}%); tracks_head: {n_th/1e6:.2f}M  "
+            f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}  "
+            f"disable_render_gate={args.disable_render_gate}  render_gate={float(dit.render_gate.detach().float().item()):.4g}"
+        )
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     n_samples = len(embed_cache)
@@ -1187,15 +1357,24 @@ def main() -> None:
                 latent_model_input = torch.cat([noisy_latents, condition], dim=1)
                 target = noise - clean_latents
 
+                # Render-dropout for CFG: see train_fsdp.py for rationale.
+                drop_render_step = False
+                if args.render_dropout_prob > 0:
+                    drop_g = torch.Generator()
+                    drop_g.manual_seed(int(args.seed) * 1_000_003 + epoch * 65521 + global_step)
+                    drop_render_step = bool(
+                        torch.rand((1,), generator=drop_g).item() < args.render_dropout_prob
+                    )
+
                 forward_kwargs = dict(
                     hidden_states=latent_model_input,
                     timestep=timestep_batch,
                     encoder_hidden_states=prompt_embeds,
                     encoder_hidden_states_image=image_embeds,
-                    render_latents=render_latents,
+                    render_latents=None if drop_render_step else render_latents,
                     return_dict=False,
                 )
-                if query_xy is not None:
+                if query_xy is not None and not drop_render_step:
                     forward_kwargs["query_xy"] = query_xy
                     forward_kwargs["track_T"] = int(gt_xy.shape[1])
 
@@ -1391,13 +1570,19 @@ def main() -> None:
             os.makedirs(save_dir, exist_ok=True)
             unwrapped = accelerator.unwrap_model(dit)
             if args.trainable == "render_only":
-                render_state = {
-                    **{f"render_encoder.{k}": v.detach().cpu()
-                       for k, v in unwrapped.render_encoder.state_dict().items()},
-                    **{f"render_fuse.{k}": v.detach().cpu()
-                       for k, v in unwrapped.render_fuse.state_dict().items()},
-                    "render_gate": unwrapped.render_gate.detach().cpu(),
-                }
+                if args.use_embodiment_adapter:
+                    render_state = {
+                        f"embodiment.{k}": v.detach().cpu()
+                        for k, v in unwrapped.embodiment.state_dict().items()
+                    }
+                else:
+                    render_state = {
+                        **{f"render_encoder.{k}": v.detach().cpu()
+                           for k, v in unwrapped.render_encoder.state_dict().items()},
+                        **{f"render_fuse.{k}": v.detach().cpu()
+                           for k, v in unwrapped.render_fuse.state_dict().items()},
+                        "render_gate": unwrapped.render_gate.detach().cpu(),
+                    }
                 if use_tracks_loss:
                     render_state.update({
                         f"tracks_head.{k}": v.detach().cpu()

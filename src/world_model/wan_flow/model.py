@@ -42,6 +42,8 @@ from diffusers.utils.peft_utils import scale_lora_layers, unscale_lora_layers
 from diffusers.utils import logging as diffusers_logging
 from transformers import CLIPVisionModel
 
+from world_model.wan_flow.embodiment_adapter import EmbodimentAgnosticConditioning
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -194,76 +196,75 @@ class TracksHead(nn.Module):
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-    def forward(
-        self,
-        token_grid: torch.Tensor,    # (B, T_lat, H_p, W_p, D)
-        query_xy: torch.Tensor,      # (B, N, 2) in [-1, 1]
-        T_video: int,
-    ) -> torch.Tensor:
-        if token_grid.ndim != 5:
-            raise ValueError(
-                f"token_grid must be (B, T_lat, H_p, W_p, D); got {tuple(token_grid.shape)}"
-            )
-        if query_xy.ndim != 3 or query_xy.shape[-1] != 2:
-            raise ValueError(
-                f"query_xy must be (B, N, 2); got {tuple(query_xy.shape)}"
-            )
+    def forward(self, token_grid, query_xy, T_video=None, chunk_size: int = 16384):
+        """
+        Args:
+            token_grid: (B, T_lat, H_p, W_p, D) latent feature grid from transformer blocks.
+            query_xy: (B, N, 2) normalized query coordinates in [-1, 1].
+            T_video: Final number of output frames (temporally upsampled).
+            chunk_size: Max points to process in one pass to avoid OOM.
+        Returns:
+            trajs: (B, T_video, N, 2) predicted absolute coordinates in [-1, 1].
+        """
         B, T_lat, H_p, W_p, D = token_grid.shape
         N = query_xy.shape[1]
-        compute_dtype = self.mlp[0].weight.dtype
-        token_grid = token_grid.to(compute_dtype)
-        query_xy = query_xy.to(compute_dtype)
+        compute_dtype = token_grid.dtype
+        T_video = T_video or T_lat
 
-        # ---- 1) bilinear-sample token_grid at query_xy for every latent frame ----
-        # Reshape (B, T_lat, H_p, W_p, D) -> (B*T_lat, D, H_p, W_p) so
-        # F.grid_sample can do all latent frames in a single call.
-        grid_btd = token_grid.permute(0, 1, 4, 2, 3).reshape(B * T_lat, D, H_p, W_p)
-        # Per-(B, T_lat) sampling grid: (B*T_lat, 1, N, 2). Same query_xy reused
-        # across all latent frames within a sample.
-        sampling_grid = (
-            query_xy.unsqueeze(1)        # (B, 1, N, 2)
-            .expand(B, T_lat, N, 2)      # (B, T_lat, N, 2)
-            .reshape(B * T_lat, 1, N, 2)
-        )
-        sampled = F.grid_sample(
-            grid_btd, sampling_grid, mode="bilinear",
-            padding_mode="border", align_corners=True,
-        )  # (B*T_lat, D, 1, N)
-        sampled = sampled.squeeze(2).permute(0, 2, 1)        # (B*T_lat, N, D)
-        sampled = sampled.reshape(B, T_lat, N, D)
+        # Process in chunks of N points if N is large (e.g. dense flow)
+        all_d_video = []
+        for i in range(0, N, chunk_size):
+            q_chunk = query_xy[:, i : i + chunk_size] # (B, Nc, 2)
+            Nc = q_chunk.shape[1]
 
-        # ---- 2) positional encodings ----
-        xy_pe = _sinusoidal_posenc(query_xy, self.num_freqs_xy)   # (B, N, 4*F_xy)
-        xy_pe = xy_pe.unsqueeze(1).expand(B, T_lat, N, xy_pe.shape[-1])
+            # ---- 1) bilinear sample features ----
+            grid_btd = token_grid.permute(0, 1, 4, 2, 3).reshape(B * T_lat, D, H_p, W_p)
+            sampling_grid = (
+                q_chunk.unsqueeze(1)
+                .expand(B, T_lat, Nc, 2)
+                .reshape(B * T_lat, 1, Nc, 2)
+            )
+            sampled = F.grid_sample(
+                grid_btd, sampling_grid, mode="bilinear",
+                padding_mode="border", align_corners=True,
+            )  # (B*T_lat, D, 1, Nc)
+            sampled = sampled.squeeze(2).permute(0, 2, 1)        # (B*T_lat, Nc, D)
+            sampled = sampled.reshape(B, T_lat, Nc, D)
 
-        t_norm = (
-            torch.arange(T_lat, device=token_grid.device, dtype=compute_dtype)
-            / max(T_lat - 1, 1) * 2.0 - 1.0
-        )                                                      # (T_lat,) in [-1, 1]
-        t_pe = _sinusoidal_posenc(t_norm.unsqueeze(-1), self.num_freqs_t)
-        # (T_lat, 2*F_t)
-        t_pe = t_pe.view(1, T_lat, 1, t_pe.shape[-1]).expand(B, T_lat, N, -1)
+            # ---- 2) positional encodings ----
+            xy_pe = _sinusoidal_posenc(q_chunk, self.num_freqs_xy)   # (B, Nc, 4*F_xy)
+            xy_pe = xy_pe.unsqueeze(1).expand(B, T_lat, Nc, xy_pe.shape[-1])
 
-        feat = torch.cat([sampled, xy_pe, t_pe], dim=-1)         # (B, T_lat, N, D')
+            t_norm = (
+                torch.arange(T_lat, device=token_grid.device, dtype=compute_dtype)
+                / max(T_lat - 1, 1) * 2.0 - 1.0
+            )
+            t_pe = _sinusoidal_posenc(t_norm.unsqueeze(-1), self.num_freqs_t)
+            t_pe = t_pe.view(1, T_lat, 1, t_pe.shape[-1]).expand(B, T_lat, Nc, -1)
 
-        # ---- 3) MLP -> delta_xy at latent rate ----
-        d_lat = self.mlp(feat)                                    # (B, T_lat, N, 2)
+            feat = torch.cat([sampled, xy_pe, t_pe], dim=-1)         # (B, T_lat, Nc, D')
 
-        # ---- 4) temporal upsample to T_video frames ----
-        if T_video != T_lat:
-            # interpolate along T axis; reshape so T is the spatial axis.
-            d_lat_for_interp = d_lat.permute(0, 2, 3, 1).reshape(B * N * 2, 1, T_lat)
-            d_video = F.interpolate(
-                d_lat_for_interp, size=T_video, mode="linear", align_corners=True,
-            )                                                     # (B*N*2, 1, T_video)
-            d_video = d_video.reshape(B, N, 2, T_video).permute(0, 3, 1, 2)
-            # (B, T_video, N, 2)
-        else:
-            d_video = d_lat
+            # ---- 3) MLP -> delta_xy at latent rate ----
+            d_lat = self.mlp(feat)                                    # (B, T_lat, Nc, 2)
 
-        # ---- 5) absolute xy = query + delta ----
-        pred_xy = query_xy.unsqueeze(1) + d_video                 # (B, T_video, N, 2)
-        return pred_xy
+            # ---- 4) temporal upsample to T_video frames ----
+            if T_video != T_lat:
+                d_lat_for_interp = d_lat.permute(0, 2, 3, 1).reshape(B * Nc * 2, 1, T_lat)
+                d_video = F.interpolate(
+                    d_lat_for_interp, size=T_video, mode="linear", align_corners=True,
+                )
+                d_video = d_video.reshape(B, Nc, 2, T_video).permute(0, 3, 1, 2)
+            else:
+                d_video = d_lat
+
+            all_d_video.append(d_video)
+
+        # Recombine chunks
+        d_video_all = torch.cat(all_d_video, dim=2) # (B, T_video, N, 2)
+
+        # ---- 5) compute absolute trajs starting from query_xy ----
+        trajs = query_xy.unsqueeze(1) + d_video_all
+        return trajs
 
 
 class WanTransformerRenderConditioned(WanTransformer3DModel):
@@ -285,6 +286,7 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
         "time_proj",
         "render_encoder",
         "render_fuse",
+        "embodiment",
         "tracks_head",
         "scale_shift_table",
         "norm_out",
@@ -311,6 +313,8 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
         render_latent_channels: int = 16,
         render_encoder_kwargs: Optional[Dict[str, Any]] = None,
         tracks_head_kwargs: Optional[Dict[str, Any]] = None,
+        use_embodiment_adapter: bool = False,
+        embodiment_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             patch_size,
@@ -331,40 +335,89 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
             pos_embed_seq_len,
         )
         inner_dim = num_attention_heads * attention_head_dim
-        re_kw = dict(render_encoder_kwargs or {})
-        self.render_encoder = RenderLatentEncoder(
-            in_channels=render_latent_channels, out_dim=inner_dim, **re_kw
-        )
-        # Fusion projection: render_encoder output -> additive perturbation to
-        # the timestep embedding (EgoWM Eq. 5). We *want* temb unchanged at
-        # step 0 (so the pretrained Wan behaviour is preserved exactly), but
-        # zero-init'ing render_fuse.weight creates a gradient bottleneck that
-        # also zeros out grad-flow back into render_encoder
-        # (dL/dr_tokens = dL/dz_render · W_fuse.T = 0 when W_fuse = 0). The
-        # optimizer then collapses to "do-nothing" attractor and gn -> 0
-        # while flow_loss stays at the pretrained baseline.
-        # Fix: keep render_fuse weight at a healthy non-zero init (default
-        # kaiming-uniform) and gate the *output* with a single learnable
-        # scalar initialized to zero. Then:
-        #     z_render = render_gate * render_fuse(r_tokens)
-        # is exactly zero at init (preserving pretrained behavior), but
-        # gradients still flow through render_fuse to render_encoder via
-        # the gate (dL/dr_tokens has a non-trivial path from step 1 onward).
-        # This is the same trick used by ControlNet (zero-conv) /
-        # IP-Adapter / FLUX-Redux to start adapters from identity without
-        # killing the bootstrap.
-        self.render_fuse = nn.Linear(inner_dim, inner_dim)
-        # Bias to zero so the constant-component of z_render is also zero
-        # at init (otherwise even with gate=0, gradient updates to bias
-        # would re-introduce a constant temb shift in the first step).
-        nn.init.zeros_(self.render_fuse.bias)
-        self.render_gate = nn.Parameter(torch.zeros(1))
-        self.render_encoder.to(torch.float32)
-        self.render_fuse.to(torch.float32)
+        # ``use_embodiment_adapter`` switches between two conditioning paths:
+        #   * False (legacy, default): EgoWM Eq. 5 — pooled per-frame render
+        #     summary added to the time-pathway, modulating AdaLN globally
+        #     per token. Cheap but loses spatial structure (see
+        #     ARCHITECTURE_REVIEW.md §1.1).
+        #   * True (recommended for scaling): spatial KV bank +
+        #     per-block cross-attn adapters + decoupled AdaLN deltas
+        #     (``EmbodimentAgnosticConditioning``). Identity-at-init.
+        self.use_embodiment_adapter = bool(use_embodiment_adapter)
+
+        if self.use_embodiment_adapter:
+            emb_kw = dict(embodiment_kwargs or {})
+            emb_kw.setdefault("inner_dim", inner_dim)
+            emb_kw.setdefault("num_blocks", num_layers)
+            emb_kw.setdefault("render_in_channels", render_latent_channels)
+            self.embodiment = EmbodimentAgnosticConditioning(**emb_kw)
+            self.embodiment.to(torch.float32)
+        else:
+            re_kw = dict(render_encoder_kwargs or {})
+            self.render_encoder = RenderLatentEncoder(
+                in_channels=render_latent_channels, out_dim=inner_dim, **re_kw
+            )
+            # Fusion projection: render_encoder output -> additive perturbation to
+            # the timestep embedding (EgoWM Eq. 5). Healthy non-zero init keeps
+            # gradient flowing back into render_encoder; the scalar render_gate
+            # (initialized to zero) makes the actual contribution exactly zero
+            # at step 0 while not killing the gradient bootstrap. This is the
+            # same trick used by ControlNet (zero-conv) / IP-Adapter / FLUX-Redux.
+            self.render_fuse = nn.Linear(inner_dim, inner_dim)
+            nn.init.zeros_(self.render_fuse.bias)
+            self.render_gate = nn.Parameter(torch.zeros(1))
+            self.render_encoder.to(torch.float32)
+            self.render_fuse.to(torch.float32)
 
         th_kw = dict(tracks_head_kwargs or {})
         self.tracks_head = TracksHead(in_dim=inner_dim, **th_kw)
         self.tracks_head.to(torch.float32)
+
+    def reset_zero_gates(self) -> None:
+        """Re-apply the identity-at-init zero-init on every gated pathway.
+
+        ``_materialize_meta_submodules`` (used by both train.py and train_fsdp.py)
+        replaces meta tensors via ``to_empty + reset_parameters``. ``reset_parameters``
+        wipes our explicit zero-inits (e.g. ``DecoupledAdaLNHead.up`` →
+        kaiming-uniform, ``MultiheadAttention.out_proj`` → xavier). Without
+        re-zeroing, "vanilla Wan at step 0" is no longer preserved.
+
+        Safe to call anytime; it only zeros tensors that the architecture
+        guarantees should be zero at init.
+        """
+        with torch.no_grad():
+            if self.use_embodiment_adapter:
+                self.embodiment.render_to_adaln.up.weight.zero_()
+                if self.embodiment.render_to_adaln.up.bias is not None:
+                    self.embodiment.render_to_adaln.up.bias.zero_()
+                self.embodiment.state_to_adaln.up.weight.zero_()
+                if self.embodiment.state_to_adaln.up.bias is not None:
+                    self.embodiment.state_to_adaln.up.bias.zero_()
+                self.embodiment.render_adaln_gate.zero_()
+                self.embodiment.state_adaln_gate.zero_()
+                for adapter in self.embodiment.adapters.values():
+                    adapter.attn.out_proj.weight.zero_()
+                    if adapter.attn.out_proj.bias is not None:
+                        adapter.attn.out_proj.bias.zero_()
+                    adapter.gate.zero_()
+                if getattr(self.embodiment, "use_eq5_residual", False):
+                    if hasattr(self.embodiment, "render_fuse_gate"):
+                        self.embodiment.render_fuse_gate.zero_()
+                if getattr(self.embodiment, "use_action_aware_adaln", False):
+                    # Only zero the gate; KEEP `adaln_head.up` healthy
+                    # (kaiming-uniform from FSDP's reset_parameters). Zeroing
+                    # both creates the dual-zero gradient bootstrap bug —
+                    # ∂L/∂gate ∝ head_output and ∂L/∂head ∝ gate, so if both
+                    # are zero, no gradient ever flows and the pathway stays
+                    # at identity forever.
+                    self.embodiment.action_aware_adaln.gate.zero_()
+            else:
+                self.render_gate.zero_()
+                if self.render_fuse.bias is not None:
+                    self.render_fuse.bias.zero_()
+            # Tracks head's final layer is zero-init for "no motion at step 0".
+            nn.init.zeros_(self.tracks_head.mlp[-1].weight)
+            nn.init.zeros_(self.tracks_head.mlp[-1].bias)
 
     def forward(
         self,
@@ -373,6 +426,7 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         render_latents: Optional[torch.Tensor] = None,
+        actions: Optional[torch.Tensor] = None,
         query_xy: Optional[torch.Tensor] = None,
         track_T: Optional[int] = None,
         return_dict: bool = True,
@@ -433,69 +487,101 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
             )
         )  # temb_base: (B, inner_dim); _unused_proj discarded (re-derived below).
 
-        # Per-latent-frame render embedding Z_render = render_fuse(render_encoder(render_latents)).
-        # render_encoder emits (B, T_lat, inner_dim); we align to post_patch_num_frames
-        # (= T_latent since p_t=1) via linear interpolation if needed.
-        # Match the render-encoder runtime dtype (bf16 under FSDP in train_fsdp,
-        # fp32 in non-FSDP paths) to avoid input/weight dtype mismatch since
-        # there is no autocast around this call in the FSDP path.
-        re_dtype = next(self.render_encoder.parameters()).dtype
-        r_tokens = self.render_encoder(
-            render_latents.to(device=hidden_states.device, dtype=re_dtype)
-        )  # (B, T_lat, inner_dim)
-        if r_tokens.shape[1] != post_patch_num_frames:
-            r_tokens = torch.nn.functional.interpolate(
-                r_tokens.transpose(1, 2),
-                size=post_patch_num_frames,
-                mode="linear",
-                align_corners=False,
-            ).transpose(1, 2)
-        rf_dtype = self.render_fuse.weight.dtype
-        # render_fuse has *healthy* non-zero weight init -- the zero-init lives
-        # on the scalar render_gate below, which keeps z_render = 0 at step 0
-        # while still allowing gradient to flow back into render_encoder via
-        # the gated path. See __init__ for the rationale.
-        z_render = self.render_fuse(r_tokens.to(dtype=rf_dtype))  # (B, T_lat, inner_dim)
-        z_render = self.render_gate.to(dtype=z_render.dtype) * z_render
-        z_render = z_render.to(dtype=temb_base.dtype)
-
-        # Broadcast per-frame render embedding to per-token: repeat each latent
-        # frame's vector across the (p_h * p_w) spatial patches of that frame.
-        z_render_per_token = z_render.repeat_interleave(tokens_per_frame, dim=1)
-        # (B, num_tokens, inner_dim)
-
-        # EgoWM Eq. 5: temb = Z_ts + Z_render, per token.
-        temb = temb_base.unsqueeze(1).expand(-1, num_tokens, -1) + z_render_per_token
-        # (B, num_tokens, inner_dim)
-
-        # Recompute modulation projection from render-modified temb
-        # (time_proj ∘ SiLU). With render_fuse zero-initialized, temb == temb_base
-        # broadcast, so timestep_proj reduces to timestep_proj_base broadcast —
-        # pretrained Wan behavior is preserved exactly at step 0.
         ce = self.condition_embedder
-        tp_in = ce.act_fn(temb.to(ce.time_proj.weight.dtype))
-        timestep_proj = ce.time_proj(tp_in).to(dtype=temb.dtype)
-        # (B, num_tokens, 6*inner_dim)
-        timestep_proj = timestep_proj.unflatten(2, (6, -1))  # (B, num_tokens, 6, inner_dim)
+        kv_bank: Optional[torch.Tensor] = None
+        # ``temb_for_norm_out`` is what's added to ``self.scale_shift_table`` for
+        # the FINAL norm_out modulation. Per-token in the legacy path (EgoWM
+        # Eq. 5) and per-batch in the adapter path (vanilla Wan, since the
+        # decoupled AdaLN delta lives inside the block loop).
+        if self.use_embodiment_adapter:
+            # New path: spatial KV bank + per-block cross-attn adapters +
+            # decoupled AdaLN deltas. See embodiment_adapter.py for the
+            # full design (and ARCHITECTURE_REVIEW.md §4.1 for rationale).
+            mod_in = ce.act_fn(temb_base.to(ce.time_proj.weight.dtype))
+            mod_base = ce.time_proj(mod_in).to(dtype=temb_base.dtype)  # (B, 6*D)
+
+            re_dtype = next(self.embodiment.parameters()).dtype
+            actions_cast = (
+                actions.to(device=hidden_states.device, dtype=re_dtype)
+                if actions is not None
+                else None
+            )
+            cond = self.embodiment(
+                render_latents.to(device=hidden_states.device, dtype=re_dtype),
+                tokens_per_frame=tokens_per_frame,
+                num_post_patch_frames=post_patch_num_frames,
+                actions=actions_cast,
+            )
+            timestep_proj = self.embodiment.combine_modulation(mod_base, cond)
+            # (B, num_tokens, 6, inner_dim) — at init this equals mod_base
+            # broadcast, so vanilla Wan behaviour is preserved bit-exact.
+            timestep_proj = timestep_proj.to(dtype=hidden_states.dtype)
+            kv_bank = cond["kv_bank"].to(dtype=hidden_states.dtype)
+            temb_for_norm_out = temb_base  # (B, D)
+        else:
+            # Legacy path: EgoWM Eq. 5 — pooled per-frame render summary
+            # added to the time pathway. Loses spatial information; kept
+            # only for ablation / backward-compat with existing checkpoints.
+            re_dtype = next(self.render_encoder.parameters()).dtype
+            r_tokens = self.render_encoder(
+                render_latents.to(device=hidden_states.device, dtype=re_dtype)
+            )  # (B, T_lat, inner_dim)
+            if r_tokens.shape[1] != post_patch_num_frames:
+                r_tokens = torch.nn.functional.interpolate(
+                    r_tokens.transpose(1, 2),
+                    size=post_patch_num_frames,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)
+            rf_dtype = self.render_fuse.weight.dtype
+            z_render = self.render_fuse(r_tokens.to(dtype=rf_dtype))  # (B, T_lat, inner_dim)
+            z_render = self.render_gate.to(dtype=z_render.dtype) * z_render
+            z_render = z_render.to(dtype=temb_base.dtype)
+
+            # Broadcast per-frame render embedding to per-token.
+            z_render_per_token = z_render.repeat_interleave(tokens_per_frame, dim=1)
+            temb_per_token = temb_base.unsqueeze(1).expand(-1, num_tokens, -1) + z_render_per_token
+
+            tp_in = ce.act_fn(temb_per_token.to(ce.time_proj.weight.dtype))
+            timestep_proj = ce.time_proj(tp_in).to(dtype=temb_per_token.dtype)
+            timestep_proj = timestep_proj.unflatten(2, (6, -1))
+            temb_for_norm_out = temb_per_token  # (B, num_tokens, D)
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
                 hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
                 )
+                if (
+                    self.use_embodiment_adapter
+                    and str(i) in self.embodiment.adapters
+                    and kv_bank is not None
+                ):
+                    adapter = self.embodiment.adapters[str(i)]
+                    hidden_states = self._gradient_checkpointing_func(adapter, hidden_states, kv_bank)
         else:
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+                if (
+                    self.use_embodiment_adapter
+                    and str(i) in self.embodiment.adapters
+                    and kv_bank is not None
+                ):
+                    hidden_states = self.embodiment.adapters[str(i)](hidden_states, kv_bank)
 
-        if temb.ndim == 3:
-            shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
+        if temb_for_norm_out.ndim == 3:
+            # Per-token (legacy path).
+            shift, scale = (
+                self.scale_shift_table.unsqueeze(0) + temb_for_norm_out.unsqueeze(2)
+            ).chunk(2, dim=2)
             shift = shift.squeeze(2)
             scale = scale.squeeze(2)
         else:
-            shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+            # Per-batch scalar (adapter path or vanilla Wan).
+            shift, scale = (self.scale_shift_table + temb_for_norm_out.unsqueeze(1)).chunk(2, dim=1)
 
         shift = shift.to(hidden_states.device)
         scale = scale.to(hidden_states.device)
@@ -563,6 +649,7 @@ class RenderConditionedWanDiffusion(nn.Module):
         image_embeddings: torch.Tensor,
         prompt_embeddings: torch.Tensor,
         t: torch.Tensor,
+        actions: Optional[torch.Tensor] = None,
     ):
         return self.dit(
             hidden_states=latent_model_input,
@@ -570,6 +657,7 @@ class RenderConditionedWanDiffusion(nn.Module):
             encoder_hidden_states=prompt_embeddings,
             encoder_hidden_states_image=image_embeddings,
             render_latents=render_latents,
+            actions=actions,
             return_dict=False,
         )[0]
 
@@ -663,6 +751,8 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        query_xy: Optional[torch.Tensor] = None,
+        track_T: Optional[int] = None,
     ):
         if self.config.expand_timesteps or self.config.boundary_ratio is not None or self.transformer_2 is not None:
             raise NotImplementedError(
@@ -845,15 +935,22 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
                 latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
                 timestep = t.expand(latents.shape[0])
 
-                noise_pred = self.transformer(
+                model_out = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
                     encoder_hidden_states=prompt_embeds,
                     encoder_hidden_states_image=image_embeds,
                     render_latents=render_latents,
+                    query_xy=query_xy if (query_xy is not None and i == len(timesteps) - 1) else None,
+                    track_T=track_T,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
-                )[0]
+                )
+                noise_pred = model_out[0]
+                if i == len(timesteps) - 1 and len(model_out) > 1:
+                    pred_tracks = model_out[1]
+                else:
+                    pred_tracks = None
 
                 if self.do_classifier_free_guidance:
                     noise_uncond = self.transformer(
@@ -905,9 +1002,14 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
         self.maybe_free_model_hooks()
 
         if not return_dict:
+            if pred_tracks is not None:
+                return (video, pred_tracks)
             return (video,)
 
-        return WanPipelineOutput(frames=video)
+        out = WanPipelineOutput(frames=video)
+        if pred_tracks is not None:
+            out.pred_tracks = pred_tracks
+        return out
 
 
 def build_render_conditioned_wan_i2v(

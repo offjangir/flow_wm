@@ -36,17 +36,38 @@ def _load_video_frames(path: str, num_frames: int) -> List[Image.Image]:
         reader.close()
     if len(all_frames) == 0:
         raise ValueError(f"No frames read from {path}")
+    if len(all_frames) < num_frames:
+        # Silent frame duplication via np.linspace makes short clips look like they
+        # trained fine but the model only ever sees ``len(all_frames)`` distinct
+        # frames per sample. Fail fast so the caller picks shorter num_frames.
+        raise ValueError(
+            f"{path}: only {len(all_frames)} frames available, but num_frames={num_frames} "
+            f"was requested. Either lower num_frames or drop this clip from the manifest."
+        )
     idxs = np.linspace(0, len(all_frames) - 1, num_frames).astype(int)
     return [all_frames[i] for i in idxs]
 
 
 def _load_tracks_npz(
-    path: str, num_frames: int
+    path: str,
+    num_frames: int,
+    target_height: Optional[int] = None,
+    target_width: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
     """Load + temporally subsample sparse AllTracker tracks; normalize xy to [-1, 1].
 
+    Tracks were extracted at AllTracker's working canvas ``(H_track, W_track)``
+    (preserves the source video's aspect ratio). The DiT trains on a fixed
+    ``(target_height, target_width)`` resize that may NOT preserve aspect
+    ratio (DROID 1280×720 → 240×432 changes ~16:9 → 9:5). If we normalize
+    using ``(W_track, H_track)`` the tracks land in the AllTracker canvas
+    coords; once the video is squished to the training canvas, the tracks
+    are off the gripper. Re-project pixel coords into the training canvas
+    *before* normalizing whenever both dimensions are provided.
+
     Returns:
-        trajs:  ``(num_frames, N, 2)`` float32 in [-1, 1] (grid_sample coords)
+        trajs:  ``(num_frames, N, 2)`` float32 in [-1, 1] (grid_sample coords,
+            in the training canvas if target_h/w supplied, else AllTracker canvas)
         visibs: ``(num_frames, N)`` float32 in {0, 1}
         (H_track, W_track): the AllTracker working frame size, useful for
             converting back to pixels at viz time.
@@ -62,10 +83,19 @@ def _load_tracks_npz(
     trajs = trajs[idxs]                                # (num_frames, N, 2)
     visibs = visibs[idxs]                              # (num_frames, N)
 
-    # Normalize pixel xy -> grid_sample [-1, 1].
+    if target_height is not None and target_width is not None:
+        sx = float(target_width) / float(max(W_track, 1))
+        sy = float(target_height) / float(max(H_track, 1))
+        denom_w = max(target_width - 1, 1)
+        denom_h = max(target_height - 1, 1)
+    else:
+        sx = sy = 1.0
+        denom_w = max(W_track - 1, 1)
+        denom_h = max(H_track - 1, 1)
+
     trajs_norm = trajs.copy()
-    trajs_norm[..., 0] = (trajs_norm[..., 0] / max(W_track - 1, 1)) * 2.0 - 1.0
-    trajs_norm[..., 1] = (trajs_norm[..., 1] / max(H_track - 1, 1)) * 2.0 - 1.0
+    trajs_norm[..., 0] = (trajs_norm[..., 0] * sx / denom_w) * 2.0 - 1.0
+    trajs_norm[..., 1] = (trajs_norm[..., 1] * sy / denom_h) * 2.0 - 1.0
 
     return (
         torch.from_numpy(trajs_norm),
@@ -164,7 +194,8 @@ class RenderI2VMetadataDataset(Dataset):
             t = row.get("tracks", "") or ""
             if t:
                 trajs, visibs, (H_t, W_t) = _load_tracks_npz(
-                    self._abs(t), self.num_frames
+                    self._abs(t), self.num_frames,
+                    target_height=self.height, target_width=self.width,
                 )
                 sample["trajs"] = trajs           # (num_frames, N, 2) in [-1, 1]
                 sample["visibs"] = visibs         # (num_frames, N) in {0, 1}

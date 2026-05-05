@@ -1,0 +1,5 @@
+{
+  "panda":    "/data/yjangir/sidegig/wm/drrobot/output/franka_emika_panda_complement1",
+  "humanoid": "/data/yjangir/sidegig/wm/checkpoints/drrobot_humanoid",
+  "widowx":   "/data/yjangir/sidegig/wm/checkpoints/drrobot_widowx"
+}

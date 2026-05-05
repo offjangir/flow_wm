@@ -1,0 +1,19 @@
+<mujoco model="panda scene">
+  <include file="panda.xml" />
+
+  <statistic center="0.3 0 0.4" extent="1" />
+
+  <visual>
+     <headlight ambient="0.5 0.5 0.5" diffuse="0.5 0.5 0.5" specular="0.02 0.02 0.02" />
+    
+  </visual>
+
+  <asset>
+    <texture builtin="gradient" height="3072" rgb1="1.0 1.0 1.0" rgb2="1.0 1.0 1.0" type="skybox" width="512" />
+    
+  </asset>
+
+  <worldbody>
+    
+  </worldbody>
+</mujoco>

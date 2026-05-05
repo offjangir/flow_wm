@@ -85,12 +85,31 @@ OUT_VIZ_DIR = DATA_WAN / "alltracker_viz"
 METADATA_CSV = DATA_WAN / "metadata.csv"
 
 
-def _enumerate_droid_clips(droid_root: Path, camera: str) -> List[Tuple[str, Path]]:
-    """Walk ``<droid_root>/scene_*/recordings/MP4/<camera>.mp4`` and return a
-    list of ``(scene_name, mp4_path)`` tuples. ``scene_name`` is the scene-dir
-    basename (e.g. ``scene_Tue_May__9_01:17:11_2023``), which is how the
-    outputs are named in ``data_wan/alltracker_tracks/`` and
-    ``data_wan/alltracker_viz/``.
+def _read_scene_metadata(scene_dir: Path) -> Optional[dict]:
+    """Load DROID per-scene metadata. Matches both `metadata_<uuid>.json` and
+    the simpler `metadata.json` written by scripts/download_droid_5k.py."""
+    import json as _json
+    paths = list(scene_dir.glob("metadata_*.json")) + list(scene_dir.glob("metadata.json"))
+    if not paths:
+        return None
+    with open(paths[0], "r") as f:
+        return _json.load(f)
+
+
+def _enumerate_droid_clips(
+    droid_root: Path,
+    camera: str,
+    camera_key: Optional[str] = None,
+) -> List[Tuple[str, Path]]:
+    """Walk ``<droid_root>/scene_*/recordings/MP4/<serial>.mp4``.
+
+    Two modes:
+      * ``camera_key`` set (e.g. "ext1", "ext2", "wrist"): per-scene serial is
+        read from each scene's metadata.json (``<key>_cam_serial``). This
+        matches prepare_data_wan.py and is the right behavior for DROID, where
+        ext1's ZED serial varies between scenes.
+      * Otherwise: ``camera`` is treated as a literal filename stem (single
+        serial across the dataset — legacy behavior).
     """
     if not droid_root.is_dir():
         raise SystemExit(f"--droid_root {droid_root} is not a directory")
@@ -98,15 +117,25 @@ def _enumerate_droid_clips(droid_root: Path, camera: str) -> List[Tuple[str, Pat
     for scene_dir in sorted(droid_root.iterdir()):
         if not scene_dir.is_dir() or not scene_dir.name.startswith("scene_"):
             continue
-        mp4 = scene_dir / "recordings" / "MP4" / f"{camera}.mp4"
+        if camera_key is not None:
+            md = _read_scene_metadata(scene_dir)
+            if md is None:
+                print(f"  [skip] {scene_dir.name}: missing metadata.json")
+                continue
+            serial = md.get(f"{camera_key}_cam_serial")
+            if not serial:
+                print(f"  [skip] {scene_dir.name}: metadata missing {camera_key}_cam_serial")
+                continue
+            mp4 = scene_dir / "recordings" / "MP4" / f"{serial}.mp4"
+        else:
+            mp4 = scene_dir / "recordings" / "MP4" / f"{camera}.mp4"
         if not mp4.is_file():
             print(f"  [skip] {scene_dir.name}: missing {mp4}")
             continue
         out.append((scene_dir.name, mp4))
     if not out:
-        raise SystemExit(
-            f"no DROID clips matched {droid_root}/<scene>/recordings/MP4/{camera}.mp4"
-        )
+        target = f"<scene>/recordings/MP4/<{camera_key}_cam_serial>.mp4" if camera_key else f"<scene>/recordings/MP4/{camera}.mp4"
+        raise SystemExit(f"no DROID clips matched {droid_root}/{target}")
     return out
 
 
@@ -680,7 +709,13 @@ def main() -> None:
                         "set, --clips_dir is ignored.")
     p.add_argument("--droid_camera", type=str, default="20103212",
                    help="DROID camera serial (filename stem inside "
-                        "recordings/MP4/). Defaults to 20103212.")
+                        "recordings/MP4/). Defaults to 20103212. Ignored when "
+                        "--droid_camera_key is set.")
+    p.add_argument("--droid_camera_key", type=str, default=None,
+                   choices=[None, "ext1", "ext2", "wrist"],
+                   help="Read per-scene serial from metadata.json (key + "
+                        "'_cam_serial'). DROID's ZED serials vary per scene, "
+                        "so this is preferred over --droid_camera.")
     p.add_argument("--clips_dir", type=Path, default=CLIPS_DIR,
                    help="Fallback: flat directory of <scene>.mp4 to process "
                         "(used only when --no-droid_root is passed).")
@@ -763,8 +798,14 @@ def main() -> None:
     # Build the (scene_name, mp4_path) work list.
     scene_clips: List[Tuple[str, Path]]
     if args.use_droid_root:
-        print(f"[input] DROID: root={args.droid_root}  camera={args.droid_camera}.mp4")
-        scene_clips = _enumerate_droid_clips(args.droid_root, args.droid_camera)
+        if args.droid_camera_key is not None:
+            print(f"[input] DROID: root={args.droid_root}  camera_key={args.droid_camera_key} (per-scene serial from metadata.json)")
+            scene_clips = _enumerate_droid_clips(
+                args.droid_root, args.droid_camera, camera_key=args.droid_camera_key,
+            )
+        else:
+            print(f"[input] DROID: root={args.droid_root}  camera={args.droid_camera}.mp4")
+            scene_clips = _enumerate_droid_clips(args.droid_root, args.droid_camera)
     else:
         print(f"[input] flat clips dir: {args.clips_dir}")
         mp4s = sorted(args.clips_dir.glob("*.mp4"))

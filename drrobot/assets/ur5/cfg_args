@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/media/nvme-storage/robotics/differentiable-robot-rendering', model_path='./output/gsplat_full', images='images', resolution=-1, white_background=True, data_device='cuda', eval=False)

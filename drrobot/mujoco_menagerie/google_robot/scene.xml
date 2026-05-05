@@ -1,0 +1,20 @@
+<mujoco model="robot scene">
+  <include file="robot.xml" />
+
+  <statistic center="0 0 0.8" extent="2" />
+
+  <visual>
+     <headlight ambient="0.5 0.5 0.5" diffuse="0.5 0.5 0.5" specular="0.02 0.02 0.02" />
+    
+  </visual>
+
+  <asset>
+   <texture builtin="gradient" height="3072" rgb1="1.0 1.0 1.0" rgb2="1.0 1.0 1.0" type="skybox" width="512" />
+    
+  </asset>
+
+  <worldbody>
+    
+    
+  </worldbody>
+</mujoco>

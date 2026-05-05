@@ -72,7 +72,9 @@ def get_scene_names() -> list[str]:
 
 def _load_droid_metadata(scene_name: str) -> dict | None:
     scene_dir = DROID_ROOT / scene_name
-    jsons = list(scene_dir.glob("metadata_*.json"))
+    # Match both DROID's `metadata_<uuid>.json` and the simpler `metadata.json`
+    # written by scripts/download_droid_5k.py.
+    jsons = list(scene_dir.glob("metadata_*.json")) + list(scene_dir.glob("metadata.json"))
     if not jsons:
         return None
     with open(jsons[0], "r") as f:
@@ -165,12 +167,16 @@ def write_metadata(
     renders: dict[str, Path],
     tracks: dict[str, Path],
     allow_missing_tracks: bool,
+    allow_missing_renders: bool = False,
 ) -> Path:
     csv_path = DATA_WAN / "metadata.csv"
     rows: list[dict[str, str]] = []
     skipped: list[str] = []
     for scene in scene_names:
-        if scene not in videos or scene not in renders:
+        if scene not in videos:
+            skipped.append(scene)
+            continue
+        if scene not in renders and not allow_missing_renders:
             skipped.append(scene)
             continue
         if scene not in tracks and not allow_missing_tracks:
@@ -179,7 +185,8 @@ def write_metadata(
         rows.append({
             "video": os.path.relpath(videos[scene], DATA_WAN),
             "prompt": _prompt_for_scene(scene),
-            "render": os.path.relpath(renders[scene], DATA_WAN),
+            "render": (os.path.relpath(renders[scene], DATA_WAN)
+                       if scene in renders else ""),
             "tracks": (os.path.relpath(tracks[scene], DATA_WAN)
                        if scene in tracks else ""),
         })
@@ -215,10 +222,36 @@ def main():
              "(empty `tracks` column). Default: skip such scenes.",
     )
     parser.add_argument(
+        "--allow_missing_renders", action="store_true",
+        help="Emit a row even if clips/<scene>.mp4 is missing (empty `render` "
+             "column). Useful when running the tracks/metadata phase before "
+             "rendering. Default: skip such scenes.",
+    )
+    parser.add_argument(
+        "--droid_root", type=Path, default=None,
+        help="Override DROID dataset root (default: <repo>/data/droid_10_demos).",
+    )
+    parser.add_argument(
+        "--data_wan", type=Path, default=None,
+        help="Override output root (default: <repo>/data_wan). Renders/tracks/"
+             "videos and metadata.csv all live under this directory.",
+    )
+    parser.add_argument(
         "--max_scenes", type=int, default=-1,
         help="Limit number of scenes processed (-1 = all).",
     )
     args = parser.parse_args()
+
+    global DROID_ROOT, DATA_WAN, RENDERS_DIR, VIDEOS_DIR, TRACKS_DIR
+    if args.droid_root is not None:
+        DROID_ROOT = args.droid_root.resolve()
+        print(f"[droid_root] using {DROID_ROOT}")
+    if args.data_wan is not None:
+        DATA_WAN = args.data_wan.resolve()
+        RENDERS_DIR = DATA_WAN / "clips"
+        VIDEOS_DIR = DATA_WAN / "videos"
+        TRACKS_DIR = DATA_WAN / "alltracker_tracks"
+        print(f"[data_wan] using {DATA_WAN}")
 
     DATA_WAN.mkdir(parents=True, exist_ok=True)
 
@@ -246,7 +279,10 @@ def main():
     tracks = collect_tracks(scenes)
 
     print(f"\n=== Stage 4: write metadata.csv ===")
-    write_metadata(scenes, videos, renders, tracks, args.allow_missing_tracks)
+    write_metadata(
+        scenes, videos, renders, tracks,
+        args.allow_missing_tracks, args.allow_missing_renders,
+    )
 
     print("\n=== Summary ===")
     print(f"  data_wan/videos/             : {len(videos)} target videos "

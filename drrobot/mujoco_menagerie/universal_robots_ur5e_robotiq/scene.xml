@@ -1,0 +1,28 @@
+<mujoco model="ur5e table">
+  
+  <compiler angle="radian" autolimits="true" /> 
+  
+  <include file="assets/ur5e/ur5e_assets.xml" />   
+  <include file="assets/ur5e/ur5e_0_assets.xml" />   
+  <include file="assets/robotiq/robotiq_assets.xml" />  
+  <visual>
+    <headlight diffuse="0.5 0.5 0.5" ambient="0.5 0.5 0.5" specular="0 0 0" />
+    
+  </visual>
+
+  <asset>
+    
+  </asset>
+
+   
+  <worldbody>
+   
+    
+    <body name="ur5e_robotiq" pos="0 0 0">
+      <include file="assets/ur5e/ur5e_robotiq.xml" />
+    </body>
+   
+  </worldbody> 
+
+ 
+</mujoco>

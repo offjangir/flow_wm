@@ -1,0 +1,19 @@
+<mujoco model="g1 scene">
+  <include file="g1.xml" />
+
+  <statistic center="1 -0.8 1.1" extent=".3" />
+
+  <visual>
+     <headlight ambient="0.5 0.5 0.5" diffuse="0.5 0.5 0.5" specular="0.02 0.02 0.02" />
+    
+  </visual>
+
+  <asset>
+     <texture builtin="gradient" height="3072" rgb1="1.0 1.0 1.0" rgb2="1.0 1.0 1.0" type="skybox" width="512" />
+  
+  </asset>
+
+  <worldbody>
+    
+  </worldbody>
+</mujoco>

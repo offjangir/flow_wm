@@ -212,6 +212,37 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, pass render_latents=None to the model to run vanilla I2V DiT behavior.",
     )
+    p.add_argument(
+        "--render_dropout_prob",
+        type=float,
+        default=0.0,
+        help="Per-step probability of dropping the render condition during training "
+             "(render_latents=None). Required for inference-time CFG-on-render to be "
+             "meaningful: with prob=0 the model never sees a no-render input and the "
+             "unconditional CFG branch is out-of-distribution. 0.1 is a standard value.",
+    )
+    p.add_argument(
+        "--use_embodiment_adapter",
+        action="store_true",
+        help="If set, replace the legacy pooled-vector render encoder + scalar gate "
+             "(EgoWM Eq. 5) with the EmbodimentAgnosticConditioning module: spatial KV "
+             "bank + per-block cross-attn adapters + decoupled AdaLN deltas. Identity "
+             "at init. See ARCHITECTURE_REVIEW.md §4.1.",
+    )
+    p.add_argument(
+        "--embodiment_kwargs",
+        type=lambda s: json.loads(s) if isinstance(s, str) else s,
+        default=None,
+        help="JSON dict of kwargs forwarded to EmbodimentAgnosticConditioning "
+             "(e.g. {\"use_action_aware_adaln\": true, "
+             "\"action_aware_kwargs\": {\"spatial_pool\": 2, \"action_dim\": null}}). "
+             "Pass via --config JSON; CLI accepts a JSON string.",
+    )
+    p.add_argument(
+        "--ignore_prompts",
+        action="store_true",
+        help="If set, use empty string for all text prompts during precompute.",
+    )
     p.set_defaults(**{k: v for k, v in defaults.items() if k != "config"})
     args = p.parse_args(remaining)
     if not args.model_path or not args.dataset_base_path or not args.metadata_csv:
@@ -219,7 +250,12 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _load_dit_only(model_path: str, dtype: torch.dtype) -> WanTransformerRenderConditioned:
+def _load_dit_only(
+    model_path: str,
+    dtype: torch.dtype,
+    use_embodiment_adapter: bool = False,
+    embodiment_kwargs: Optional[Dict[str, Any]] = None,
+) -> WanTransformerRenderConditioned:
     """
     Load *only* the render-conditioned DiT (no VAE / text / image encoders).
     Encoders are run once at startup by ``_precompute_embeddings`` and then
@@ -227,7 +263,12 @@ def _load_dit_only(model_path: str, dtype: torch.dtype) -> WanTransformerRenderC
     """
     root = model_path.rstrip("/")
     local_transformer = os.path.isdir(os.path.join(root, "transformer"))
-    tkw = dict(torch_dtype=dtype, render_encoder_kwargs={})
+    tkw = dict(
+        torch_dtype=dtype,
+        render_encoder_kwargs={},
+        use_embodiment_adapter=use_embodiment_adapter,
+        embodiment_kwargs=embodiment_kwargs,
+    )
     if local_transformer:
         dit = WanTransformerRenderConditioned.from_pretrained(
             os.path.join(root, "transformer"), **tkw
@@ -253,6 +294,11 @@ def main() -> None:
         mixed_precision=args.mixed_precision,
         log_with=None,
     )
+    # Snapshot the BASE output dir before _setup_run_dir_and_logging mutates
+    # it to `<base>/run_<timestamp>/`. The embed cache lives at the base so
+    # every run shares it (instant relaunch); checkpoints/logs still land in
+    # the per-run subdir.
+    args._embed_cache_base_dir = args.output_dir
     args = _setup_run_dir_and_logging(args, accelerator)
 
     # `args.mixed_precision` here controls the DiT *storage* dtype only.
@@ -327,10 +373,18 @@ def main() -> None:
             f"[FSDP train] precomputing {len(dataset.rows)} samples on rank 0 "
             f"(text + image + VAE + tracks, encoder_dtype={encoder_dtype}) ..."
         )
+        # Disk cache lives at the BASE output dir (shared across run_<ts>
+        # subdirs) so every relaunch with the same dataset hits it. Key
+        # includes dataset contents + resolution + encoders, so editing the
+        # manifest or changing height/width invalidates automatically.
+        from pathlib import Path as _Path
+        embed_cache_path = _Path(args._embed_cache_base_dir) / "embed_cache.pt"
         embed_cache, z_dim, scheduler = _precompute_embeddings(
             args.model_path, dataset, accelerator.device,
             args.height, args.width, args.num_frames, args.max_sequence_length,
             encoder_dtype=encoder_dtype,
+            ignore_prompts=bool(args.ignore_prompts),
+            cache_path=embed_cache_path,
         )
         import gc as _gc
         _gc.collect()
@@ -362,10 +416,25 @@ def main() -> None:
     # ---------------------------------------------------------------
     # Phase 2: load only the DiT on each rank, FSDP-wrap, train.
     # ---------------------------------------------------------------
-    dit = _load_dit_only(args.model_path, dtype)
+    dit = _load_dit_only(
+        args.model_path, dtype,
+        use_embodiment_adapter=bool(args.use_embodiment_adapter),
+        embodiment_kwargs=args.embodiment_kwargs,
+    )
     n_meta = _materialize_meta_submodules(dit)
+    # ``_materialize_meta_submodules`` re-runs ``reset_parameters`` on every
+    # meta submodule, which wipes the explicit zero-inits used to guarantee
+    # identity-at-init for the gated paths (DecoupledAdaLNHead.up,
+    # MultiheadAttention.out_proj, etc.). Re-apply them.
+    if hasattr(dit, "reset_zero_gates"):
+        dit.reset_zero_gates()
     if accelerator.is_main_process and n_meta > 0:
         accelerator.print(f"[FSDP train] materialized {n_meta} meta submodules on CPU")
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[FSDP train] conditioning path: "
+            f"{'embodiment_adapter' if args.use_embodiment_adapter else 'legacy_egowm_eq5'}"
+        )
     # Keep DiT on CPU until FSDP wraps it. This avoids per-rank device mismatch
     # (e.g. params on cuda:0 while rank device_id is cuda:1/2/3).
     dit = dit.cpu()
@@ -386,14 +455,18 @@ def main() -> None:
         for p_ in dit.parameters():
             p_.requires_grad = False
         if not args.drop_render_conditioning:
-            for p_ in dit.render_encoder.parameters():
-                p_.requires_grad = True
-            for p_ in dit.render_fuse.parameters():
-                p_.requires_grad = True
-            # render_gate is a top-level nn.Parameter on dit (not inside a
-            # submodule), so it isn't covered by render_encoder.parameters() or
-            # render_fuse.parameters(); enable it explicitly.
-            dit.render_gate.requires_grad = True
+            if args.use_embodiment_adapter:
+                for p_ in dit.embodiment.parameters():
+                    p_.requires_grad = True
+            else:
+                for p_ in dit.render_encoder.parameters():
+                    p_.requires_grad = True
+                for p_ in dit.render_fuse.parameters():
+                    p_.requires_grad = True
+                # render_gate is a top-level nn.Parameter on dit (not inside a
+                # submodule), so it isn't covered by render_encoder.parameters()
+                # or render_fuse.parameters(); enable it explicitly.
+                dit.render_gate.requires_grad = True
             if use_tracks_loss:
                 for p_ in dit.tracks_head.parameters():
                     p_.requires_grad = True
@@ -414,9 +487,25 @@ def main() -> None:
             p_.requires_grad = True
 
     if args.disable_render_gate:
-        with torch.no_grad():
-            dit.render_gate.data.fill_(1.0)
-        dit.render_gate.requires_grad = False
+        if args.use_embodiment_adapter:
+            # Adapter path has no single scalar render_gate; the equivalent
+            # disable-attenuation hack would be to set every gate to 1.0
+            # (render_adaln_gate, state_adaln_gate, per-adapter gate). That
+            # bypasses the identity-at-init contract intentionally and is
+            # only meant for ablation. Apply it on every gate.
+            with torch.no_grad():
+                dit.embodiment.render_adaln_gate.data.fill_(1.0)
+                dit.embodiment.state_adaln_gate.data.fill_(1.0)
+                for adapter in dit.embodiment.adapters.values():
+                    adapter.gate.data.fill_(1.0)
+            dit.embodiment.render_adaln_gate.requires_grad = False
+            dit.embodiment.state_adaln_gate.requires_grad = False
+            for adapter in dit.embodiment.adapters.values():
+                adapter.gate.requires_grad = False
+        else:
+            with torch.no_grad():
+                dit.render_gate.data.fill_(1.0)
+            dit.render_gate.requires_grad = False
 
     # All DiT params (frozen + trainable) are kept in the storage ``dtype``
     # (typically bf16). FSDP requires uniform dtype within each
@@ -433,13 +522,33 @@ def main() -> None:
     n_total = sum(p.numel() for p in dit.parameters())
     n_th = sum(p.numel() for p in dit.tracks_head.parameters())
     if accelerator.is_main_process:
-        accelerator.print(
-            f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
-            f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
-            f"tracks_head={n_th / 1e6:.2f}M  lambda_tracks={args.lambda_tracks}  "
-            f"use_tracks_loss={use_tracks_loss}  disable_render_gate={args.disable_render_gate}  "
-            f"render_gate={float(dit.render_gate.detach().float().item()):.4g}"
-        )
+        if args.use_embodiment_adapter:
+            n_emb = sum(p.numel() for p in dit.embodiment.parameters())
+            n_adapters = sum(
+                p.numel()
+                for a in dit.embodiment.adapters.values()
+                for p in a.parameters()
+            )
+            gate_str = (
+                f"render_adaln_gate={float(dit.embodiment.render_adaln_gate.float().item()):.4g} "
+                f"state_adaln_gate={float(dit.embodiment.state_adaln_gate.float().item()):.4g}"
+            )
+            accelerator.print(
+                f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
+                f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
+                f"embodiment={n_emb / 1e6:.2f}M (adapters={n_adapters / 1e6:.2f}M, "
+                f"{len(dit.embodiment.adapters)} blocks); tracks_head={n_th / 1e6:.2f}M  "
+                f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}  "
+                f"disable_render_gate={args.disable_render_gate}  {gate_str}"
+            )
+        else:
+            accelerator.print(
+                f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
+                f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
+                f"tracks_head={n_th / 1e6:.2f}M  lambda_tracks={args.lambda_tracks}  "
+                f"use_tracks_loss={use_tracks_loss}  disable_render_gate={args.disable_render_gate}  "
+                f"render_gate={float(dit.render_gate.detach().float().item()):.4g}"
+            )
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
 
@@ -609,15 +718,39 @@ def main() -> None:
                 latent_model_input = torch.cat([noisy_latents, condition], dim=1)
                 target = noise - clean_latents
 
+                # Render-dropout for CFG: with probability ``render_dropout_prob``,
+                # train this step *without* the render condition so the model
+                # learns a useful unconditional branch. Decision must be the
+                # same on every rank to keep FSDP synchronized; we draw from
+                # a deterministic generator seeded by (epoch, global_step) so
+                # all ranks get the same coin flip without an extra collective.
+                drop_render_step = False
+                if (
+                    args.render_dropout_prob > 0
+                    and not args.drop_render_conditioning
+                ):
+                    drop_g = torch.Generator()
+                    drop_g.manual_seed(int(args.seed) * 1_000_003 + epoch * 65521 + global_step)
+                    drop_render_step = bool(
+                        torch.rand((1,), generator=drop_g).item() < args.render_dropout_prob
+                    )
+
                 forward_kwargs = dict(
                     hidden_states=latent_model_input,
                     timestep=timestep_batch,
                     encoder_hidden_states=prompt_embeds,
                     encoder_hidden_states_image=image_embeds,
-                    render_latents=None if args.drop_render_conditioning else render_latents,
+                    render_latents=(
+                        None
+                        if (args.drop_render_conditioning or drop_render_step)
+                        else render_latents
+                    ),
                     return_dict=False,
                 )
-                if query_xy is not None:
+                if query_xy is not None and not drop_render_step:
+                    # When the render is dropped this step, the tracks-head
+                    # path is also disabled (it requires the conditioned
+                    # forward) -- fall back to flow-only loss for this step.
                     forward_kwargs["query_xy"] = query_xy
                     forward_kwargs["track_T"] = int(gt_xy.shape[1])
 
@@ -706,10 +839,13 @@ def main() -> None:
                     # zero grad on step 0; that's expected and recovers on step 1+.)
                     if global_step == 0 and accelerator.is_main_process:
                         inner = accelerator.unwrap_model(dit)
-                        groups = [
-                            ("render_encoder", inner.render_encoder),
-                            ("render_fuse",    inner.render_fuse),
-                        ]
+                        if args.use_embodiment_adapter:
+                            groups = [("embodiment", inner.embodiment)]
+                        else:
+                            groups = [
+                                ("render_encoder", inner.render_encoder),
+                                ("render_fuse",    inner.render_fuse),
+                            ]
                         if use_tracks_loss:
                             groups.append(("tracks_head", inner.tracks_head))
                         msg_parts = []
@@ -746,8 +882,23 @@ def main() -> None:
                                 trainable_params, max_norm=args.max_grad_norm
                             )
                         if gn is not None:
-                            grad_norm = gn.detach()
-                    grad_finite = bool(torch.isfinite(grad_norm).item()) if torch.isfinite(grad_norm).numel() else True
+                            grad_norm = gn.detach().to(device)
+                    # Rank-consistent grad-finite decision. Under FSDP,
+                    # ``dit.clip_grad_norm_`` already returns a globally-reduced
+                    # value so the per-rank isfinite check would agree -- but
+                    # for DDP fallback or future config changes the local
+                    # check can disagree across ranks, causing one rank to
+                    # skip optimizer.step while the rest step → shard drift.
+                    # Mirror the loss_finite all-reduce above for safety, and
+                    # skip the check entirely on accumulation (non-sync) steps
+                    # so the NaN sentinel (grad_norm starts as NaN) doesn't
+                    # trip a spurious warning every accumulation micro-step.
+                    if accelerator.sync_gradients:
+                        grad_finite_local = torch.isfinite(grad_norm).reshape(1).to(torch.float32)
+                        grad_finite_all = accelerator.gather_for_metrics(grad_finite_local)
+                        grad_finite = bool(grad_finite_all.min().item() > 0.5)
+                    else:
+                        grad_finite = True
                     if not grad_finite:
                         if accelerator.is_main_process:
                             accelerator.print(
@@ -790,45 +941,91 @@ def main() -> None:
                 loss_g = accelerator.gather_for_metrics(loss.detach().reshape(1)).mean()
                 flow_g = flow_g_each
                 tracks_g = accelerator.gather_for_metrics(loss_tracks.detach().reshape(1)).mean()
-                if accelerator.is_main_process:
-                    elapsed = time.time() - t0
-                    gn_disp = float(grad_norm) if torch.isfinite(grad_norm).item() else float("nan")
-                    sigma_frac = float(t_idx) / max(1, n_t - 1)
-                    bar.set_postfix(
-                        loss=f"{float(loss_g):.3f}",
-                        flow=f"{float(flow_g):.3f}",
-                        ema=f"{flow_ema:.3f}",
-                        sig=f"{sigma_frac:.2f}",
-                        gate=f"{float(accelerator.unwrap_model(dit).render_gate.item()):.4f}",
-                        tr=f"{float(tracks_g):.3f}" if pred_tracks is not None else "off",
-                        gn=f"{gn_disp:.3f}",
-                        ok="Y" if loss_is_finite else "N",
-                        step=global_step, t=f"{elapsed:.0f}s",
-                    )
-                    if use_wandb:
-                        import wandb
-                        log_payload = {
-                            "train/loss": float(loss_g),
-                            "train/loss_flow": float(flow_g),
-                            "train/loss_flow_ema": float(flow_ema),
-                            "train/loss_tracks": float(tracks_g),
-                            "train/grad_norm": gn_disp,
-                            "train/loss_is_finite": float(loss_is_finite),
-                            "train/lambda_tracks": args.lambda_tracks,
-                            "train/lr": optimizer.param_groups[0]["lr"],
-                            "train/timestep": float(timestep_scalar.item()),
-                            "train/timestep_sigma_frac": sigma_frac,
-                            "train/epoch": epoch,
-                            "train/elapsed_s": elapsed,
-                            "train/render_gate": float(accelerator.unwrap_model(dit).render_gate.item()),
-                        }
-                        # Per-quartile (by timestep) running-average flow loss.
-                        # The "mid" buckets (Q1, Q2) are the hardest and are
-                        # the best signal of actual learning progress.
-                        for k in range(4):
-                            if bucket_cnt[k] > 0:
-                                log_payload[f"train/flow_by_t_q{k}"] = bucket_sum[k] / bucket_cnt[k]
-                        wandb.log(log_payload, step=global_step)
+                # FSDP shards 1-element scalar gates (render_adaln_gate,
+                # state_adaln_gate, per-adapter gate, render_gate) across ranks,
+                # leaving 0-element local shards on most ranks. Calling .item()
+                # on those crashes with "Tensor with 0 elements cannot be
+                # converted to Scalar". summon_full_params is a collective so
+                # every rank enters; rank0_only gathers only onto rank 0.
+                inner_dit = accelerator.unwrap_model(dit)
+                with FSDP.summon_full_params(dit, writeback=False, recurse=True, rank0_only=True):
+                    if accelerator.is_main_process:
+                        elapsed = time.time() - t0
+                        gn_disp = float(grad_norm) if torch.isfinite(grad_norm).item() else float("nan")
+                        sigma_frac = float(t_idx) / max(1, n_t - 1)
+                        if args.use_embodiment_adapter:
+                            if getattr(inner_dit.embodiment, "use_action_aware_adaln", False):
+                                # action-aware gate is per-channel; show mean abs
+                                gate_disp = float(
+                                    inner_dit.embodiment.action_aware_adaln.gate.detach()
+                                    .float().abs().mean().item()
+                                )
+                            else:
+                                gate_disp = float(inner_dit.embodiment.render_adaln_gate.float().item())
+                        else:
+                            gate_disp = float(inner_dit.render_gate.float().item())
+                        bar.set_postfix(
+                            loss=f"{float(loss_g):.3f}",
+                            flow=f"{float(flow_g):.3f}",
+                            ema=f"{flow_ema:.3f}",
+                            sig=f"{sigma_frac:.2f}",
+                            gate=f"{gate_disp:.4f}",
+                            tr=f"{float(tracks_g):.3f}" if pred_tracks is not None else "off",
+                            gn=f"{gn_disp:.3f}",
+                            ok="Y" if loss_is_finite else "N",
+                            step=global_step, t=f"{elapsed:.0f}s",
+                        )
+                        if use_wandb:
+                            import wandb
+                            log_payload = {
+                                "train/loss": float(loss_g),
+                                "train/loss_flow": float(flow_g),
+                                "train/loss_flow_ema": float(flow_ema),
+                                "train/loss_tracks": float(tracks_g),
+                                "train/grad_norm": gn_disp,
+                                "train/loss_is_finite": float(loss_is_finite),
+                                "train/lambda_tracks": args.lambda_tracks,
+                                "train/lr": optimizer.param_groups[0]["lr"],
+                                "train/timestep": float(timestep_scalar.item()),
+                                "train/timestep_sigma_frac": sigma_frac,
+                                "train/epoch": epoch,
+                                "train/elapsed_s": elapsed,
+                                "train/drop_render_step": float(drop_render_step),
+                            }
+                            if args.use_embodiment_adapter:
+                                log_payload["train/render_adaln_gate"] = float(
+                                    inner_dit.embodiment.render_adaln_gate.float().item()
+                                )
+                                log_payload["train/state_adaln_gate"] = float(
+                                    inner_dit.embodiment.state_adaln_gate.float().item()
+                                )
+                                for adapter_id, adapter in inner_dit.embodiment.adapters.items():
+                                    log_payload[f"train/adapter_{adapter_id}_gate"] = float(
+                                        adapter.gate.float().item()
+                                    )
+                                # Action-aware AdaLN: gate is per-channel (D,), so log
+                                # aggregate stats. Bootstrap check: ``gate_norm`` should
+                                # ramp from 0 to ~0.1-1.0 over the first epoch. If it
+                                # stays at exactly 0, the FSDP _materialize_meta_submodules
+                                # path re-introduced the dual-zero bug — investigate
+                                # reset_zero_gates.
+                                if getattr(inner_dit.embodiment, "use_action_aware_adaln", False):
+                                    aa_gate = inner_dit.embodiment.action_aware_adaln.gate.detach().float()
+                                    log_payload["train/action_aware_gate_mean"] = float(aa_gate.mean().item())
+                                    log_payload["train/action_aware_gate_std"] = float(aa_gate.std().item())
+                                    log_payload["train/action_aware_gate_norm"] = float(aa_gate.norm().item())
+                                    log_payload["train/action_aware_gate_max_abs"] = float(aa_gate.abs().max().item())
+                            else:
+                                log_payload["train/render_gate"] = float(
+                                    inner_dit.render_gate.float().item()
+                                )
+                            # Per-quartile (by timestep) running-average flow loss.
+                            # The "mid" buckets (Q1, Q2) are the hardest and are
+                            # the best signal of actual learning progress.
+                            for k in range(4):
+                                if bucket_cnt[k] > 0:
+                                    log_payload[f"train/flow_by_t_q{k}"] = bucket_sum[k] / bucket_cnt[k]
+                            wandb.log(log_payload, step=global_step)
 
         # End-of-epoch summary: mean flow loss over the epoch. With many
         # steps this averages out timestep/sample/noise variance; with only
@@ -904,7 +1101,14 @@ def main() -> None:
             full_state = accelerator.get_state_dict(dit)
             if args.trainable == "render_only":
                 if accelerator.is_main_process:
-                    keep_prefixes = ["render_encoder.", "render_fuse."]
+                    if args.use_embodiment_adapter:
+                        keep_prefixes = ["embodiment."]
+                        keep_exact: set = set()
+                    else:
+                        keep_prefixes = ["render_encoder.", "render_fuse."]
+                        # render_gate is a top-level Parameter (no submodule
+                        # prefix). Match by exact key so it survives the strip.
+                        keep_exact = {"render_gate"}
                     if use_tracks_loss:
                         keep_prefixes.append("tracks_head.")
                     if getattr(args, "unfreeze_last_n_blocks", 0) > 0:
@@ -915,9 +1119,6 @@ def main() -> None:
                         keep_prefixes.append("proj_out.")
                         keep_prefixes.append("condition_embedder.time_proj.")
                     keep_prefixes = tuple(keep_prefixes)
-                    # render_gate is a top-level Parameter (no submodule
-                    # prefix). Match by exact key so it survives the strip.
-                    keep_exact = {"render_gate"}
                     small_state = {
                         k: v.detach().to("cpu")
                         for k, v in full_state.items()
