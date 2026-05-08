@@ -104,6 +104,14 @@ def _denoise(
     image  = cached["image_embeds"].to(device=device, dtype=dtype, non_blocking=True)
     rl = render_latents.to(device=device, dtype=dtype, non_blocking=True) if render_latents is not None else None
     use_cfg = (cfg_scale > 1.0) and (rl is not None)
+    # v2 path: per-frame actions paired with the render condition. Drop them
+    # in the unconditional branch (mirrors render_latents=None) so CFG is on
+    # the *full embodiment conditioning*, not just render.
+    actions = (
+        cached["actions"].to(device=device, dtype=dtype, non_blocking=True).unsqueeze(0)
+        if "actions" in cached else None
+    )
+    actions_cond = actions if rl is not None else None
 
     g = torch.Generator(device="cpu").manual_seed(int(seed))
     latents = torch.randn(
@@ -121,15 +129,19 @@ def _denoise(
         latent_in = torch.cat([latents, cond], dim=1)
         t_batch = t.expand(latents.shape[0]).to(device=device).float()
         with torch.amp.autocast(device_type=device.type, dtype=dtype):
-            pred_cond = model(
+            kw_cond = dict(
                 hidden_states=latent_in,
                 timestep=t_batch,
                 encoder_hidden_states=prompt,
                 encoder_hidden_states_image=image,
                 render_latents=rl,
                 return_dict=False,
-            )[0]
+            )
+            if actions_cond is not None:
+                kw_cond["actions"] = actions_cond
+            pred_cond = model(**kw_cond)[0]
             if use_cfg:
+                # Unconditional branch: drop both render and actions.
                 pred_uncond = model(
                     hidden_states=latent_in,
                     timestep=t_batch,
@@ -292,6 +304,11 @@ def main() -> None:
         height=cfg["height"],
         width=cfg["width"],
         repeat=1,
+        # v2 path: the actions stream is needed by model.forward. The dataset
+        # raises if the CSV's actions column is partially populated, so use a
+        # CSV where every row has an actions path (e.g. train_metadata_test.csv).
+        action_stats_path=cfg.get("action_stats_path"),
+        action_field=cfg.get("action_field", "state"),
     )
     n = min(args.num_samples, len(eval_ds.rows))
     print(f"[gen] generating {n} videos out of {len(eval_ds.rows)} in CSV")
@@ -320,6 +337,7 @@ def main() -> None:
         use_embodiment_adapter=bool(cfg.get("use_embodiment_adapter", False)),
         embodiment_kwargs=cfg.get("embodiment_kwargs"),
         legacy_render_variant=cfg.get("legacy_render_variant", "egowm"),
+        v2_adapter_kwargs=cfg.get("v2_adapter_kwargs"),
     )
     _materialize_meta_submodules(dit)
     if hasattr(dit, "reset_zero_gates"):

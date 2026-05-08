@@ -769,6 +769,12 @@ def main() -> None:
     # Flow-resizing.
     p.add_argument("--out_height", type=int, default=None)
     p.add_argument("--out_width", type=int, default=None)
+    p.add_argument(
+        "--dense_name_suffix", type=str, default="",
+        help="Suffix appended to dense-tracks filenames, before .npz. Lets "
+             "re-extractions at different resolutions coexist in the same "
+             "out_dense_tracks_dir. Example: '_240x432' writes "
+             "scene_00000_240x432.npz instead of scene_00000.npz.")
 
     # Dense-track visibility threshold.
     p.add_argument("--track_conf_thr", type=float, default=0.1,
@@ -833,7 +839,7 @@ def main() -> None:
     for i, (scene, mp4) in enumerate(scene_clips):
         out_flow = args.out_flow_dir / f"{scene}.npy"
         out_tracks = args.out_tracks_dir / f"{scene}.npz"
-        out_dense_tracks = args.out_dense_tracks_dir / f"{scene}.npz"
+        out_dense_tracks = args.out_dense_tracks_dir / f"{scene}{args.dense_name_suffix}.npz"
         out_viz = args.out_viz_dir / f"{scene}.mp4"
         print(f"\n=== [{i + 1}/{len(scene_clips)}] {scene}  <- {mp4} ===")
 
