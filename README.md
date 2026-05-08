@@ -16,6 +16,125 @@ pip install -e .
 
 Dependencies: PyTorch, Diffusers, Transformers, Accelerate, etc. (see `pyproject.toml`). Resolve any `transformers` / `huggingface-hub` version pins in your environment before training.
 
+## Setup on another machine (start training elsewhere)
+
+To clone this repo on a new node and start a v2 (action-conditioned) FSDP run, you need three things in addition to the code: (a) the `dr` conda env, (b) the training data under `data/droid_1k/` + `data_wan_1k/`, and (c) the eval data under `data_wan_eval/`. Pick the data path that fits your situation.
+
+### 1. Clone + env
+
+```bash
+git clone git@github.com:offjangir/flow_wm.git
+cd flow_wm
+bash scripts/setup_dr_env_and_checkpoints.sh   # creates 'dr' conda env, downloads HF Wan 2.1 ckpt
+conda activate dr
+export PYTHONPATH=src
+```
+
+### 2. Data
+
+There are two ways to get the data on the new machine. Pick one.
+
+**Option A — rsync from a machine that already has it (fast).** If both machines see the same shared filesystem (`weka`), just point at the existing path. Otherwise rsync the processed data; raw DROID is the bulky part:
+
+```bash
+# On the source machine (e.g. c001), rsync the processed data:
+rsync -avh --progress \
+    /weka/scratch/hbharad2/users/yjangir1/flow_wm/data_wan_1k/ \
+    user@new-host:/path/to/flow_wm/data_wan_1k/
+
+# Eval data (only ~2 GB):
+rsync -avh --progress \
+    /weka/scratch/hbharad2/users/yjangir1/flow_wm/data_wan_eval/ \
+    user@new-host:/path/to/flow_wm/data_wan_eval/
+
+# Raw DROID (only needed if you'll re-extract actions or run the pipeline; ~8 GB):
+rsync -avh --progress \
+    /weka/scratch/hbharad2/users/yjangir1/flow_wm/data/droid_1k/ \
+    user@new-host:/path/to/flow_wm/data/droid_1k/
+```
+
+Approximate sizes:
+
+| Path | Size | Needed for | Notes |
+|------|------|-----------|-------|
+| `data/droid_1k/` | ~8 GB | re-extracting actions / rebuilding pipeline | trajectory.h5 + raw MP4s |
+| `data_wan_1k/videos,clips,renders` | ~12 GB | training | symlinks + DrRobot renders |
+| `data_wan_1k/alltracker_tracks/` | ~900 MB | training (tracks loss) | sparse tracks .npz |
+| `data_wan_1k/alltracker_dense_tracks/` | ~185 GB | currently unused at training time | dense tracks .npz; can skip |
+| `data_wan_1k/actions/` | ~30 MB | v2 action conditioning | created by `scripts/extract_actions.py` |
+| `data_wan_1k/action_stats.json` | <1 KB | v2 z-score normalization | regeneratable |
+| `data_wan_1k/train_metadata*.csv` | <1 MB | training | regeneratable from `prepare_data_wan.py` |
+| `data_wan_eval/` | ~2 GB | inference / eval | held-out 10 scenes |
+
+**Skip `alltracker_dense_tracks/`** unless you've added a training path that uses dense tracks — it's 185 GB and the current code only reads sparse tracks.
+
+**Option B — rebuild the data pipeline on the new machine (slow).** Re-runs DROID episode sampling → DrRobot rendering → AllTracker tracks → action extraction. End-to-end this takes several hours per 1000 scenes:
+
+```bash
+# (i) Sample + download DROID episodes (default 5000; set N_EPISODES=1000 to match this dataset)
+N_EPISODES=1000 OUT_DIR=data/droid_1k RUN_EXTRACT=1 RUN_RENDER=1 \
+    bash scripts/run_droid_5k_pipeline.sh
+
+# (ii) Build held-out eval set
+bash scripts/build_eval_set.sh
+
+# (iii) Extract 8-d action streams from trajectory.h5 → data_wan_1k/actions/*.npz
+python scripts/extract_actions.py \
+    --data_root data/droid_1k \
+    --out_dir   data_wan_1k \
+    --update_csv \
+    --csv_name  train_metadata.csv
+
+# (iv) Compute z-score stats over the train split
+python -c "
+import pandas as pd, numpy as np, json
+df = pd.read_csv('data_wan_1k/train_metadata_train.csv')
+states = []
+for rel in df['actions']:
+    if rel:
+        states.append(np.load(f'data_wan_1k/{rel}')['state'])
+cat = np.concatenate(states, axis=0)
+mean = cat.mean(0).astype(np.float32); std = np.maximum(cat.std(0), 1e-6).astype(np.float32)
+json.dump({
+    'fields': ['joint_0','joint_1','joint_2','joint_3','joint_4','joint_5','joint_6','gripper'],
+    'mean': mean.tolist(), 'std': std.tolist(),
+    'source_csv': 'train_metadata_train.csv', 'n_rows': len(df), 'n_samples': int(cat.shape[0]),
+    'action_dim': 8, 'representation': 'joint_position(7) + gripper_position(1)',
+}, open('data_wan_1k/action_stats.json','w'), indent=2)
+"
+```
+
+After either path, the action npz layout is:
+- `data_wan_1k/actions/scene_<id>.npz` with fields: `state` (T, 8), `action` (T, 7) [optional], `cartesian_position`, `joint_velocity`, `gripper_position`
+- `data_wan_1k/action_stats.json` — per-dim mean/std for z-score normalization
+
+### 3. Sanity-check before launching
+
+```bash
+# Verifies the v2 init pipeline (zero-init out_proj, alive cross_attn.in_proj, identity-at-init forward).
+python scripts/audit_v2_init.py
+```
+
+### 4. Launch training
+
+For 81-frame action-conditioned v2:
+
+```bash
+# Smoke (10 videos, 2 epochs, ~10 min):
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch \
+    --config_file configs/accelerate_fsdp.yaml --num_processes 6 \
+    -m world_model.wan_flow.train_fsdp \
+    --config configs/train_drrobot_1k_10vids_v2_fsdp.json
+
+# Full 30-epoch run (~50 hr on 6×A100-80GB):
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch \
+    --config_file configs/accelerate_fsdp.yaml --num_processes 6 \
+    -m world_model.wan_flow.train_fsdp \
+    --config configs/train_drrobot_1k_legacy_8xl40_action_aware_v2.json
+```
+
+The smoke must pass cleanly before committing to the full run.
+
 ## Layout
 
 | Path | Purpose |
