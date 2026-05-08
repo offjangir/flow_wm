@@ -112,6 +112,13 @@ def eval_flow_loss(
         prompt = c["prompt_embeds"].to(device=device, dtype=dtype, non_blocking=True)
         image  = c["image_embeds"].to(device=device, dtype=dtype, non_blocking=True)
         rr     = c["render_latents"].to(device=device, dtype=dtype, non_blocking=True)
+        # v2 path: per-frame actions (B, T, action_dim). Add the batch dim;
+        # absent for the egowm/v1 legacy paths and embodiment_adapter without
+        # action_aware_adaln.
+        actions = (
+            c["actions"].to(device=device, dtype=dtype, non_blocking=True).unsqueeze(0)
+            if "actions" in c else None
+        )
 
         for _ in range(num_timesteps_per_sample):
             noise = torch.randn(clean.shape, generator=g).to(device=device, dtype=dtype)
@@ -123,15 +130,18 @@ def eval_flow_loss(
             latent_in = torch.cat([noisy, cond], dim=1)
             target = noise - clean
 
+            fwd_kw = dict(
+                hidden_states=latent_in,
+                timestep=t_batch,
+                encoder_hidden_states=prompt,
+                encoder_hidden_states_image=image,
+                render_latents=rr,
+                return_dict=False,
+            )
+            if actions is not None:
+                fwd_kw["actions"] = actions
             with torch.amp.autocast(device_type=device.type, dtype=dtype):
-                pred = model(
-                    hidden_states=latent_in,
-                    timestep=t_batch,
-                    encoder_hidden_states=prompt,
-                    encoder_hidden_states_image=image,
-                    render_latents=rr,
-                    return_dict=False,
-                )[0]
+                pred = model(**fwd_kw)[0]
 
             loss = float(F.mse_loss(pred[:, :, 1:].float(), target[:, :, 1:].float()))
             all_losses.append(loss)
@@ -218,6 +228,11 @@ def main() -> None:
         height=cfg["height"],
         width=cfg["width"],
         repeat=1,
+        # v2 path: action stream needed for inference. has_actions becomes
+        # True iff the eval CSV has the actions column populated AND the
+        # config provides a stats path.
+        action_stats_path=cfg.get("action_stats_path"),
+        action_field=cfg.get("action_field", "state"),
     )
     print(f"[eval] {len(eval_dataset.rows)} held-out samples (frames={cfg['num_frames']}, "
           f"{cfg['height']}x{cfg['width']})")
@@ -246,6 +261,7 @@ def main() -> None:
         use_embodiment_adapter=bool(cfg.get("use_embodiment_adapter", False)),
         embodiment_kwargs=cfg.get("embodiment_kwargs"),
         legacy_render_variant=cfg.get("legacy_render_variant", "egowm"),
+        v2_adapter_kwargs=cfg.get("v2_adapter_kwargs"),
     )
     _materialize_meta_submodules(dit)
     if hasattr(dit, "reset_zero_gates"):
