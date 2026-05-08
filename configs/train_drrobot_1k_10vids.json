@@ -1,0 +1,54 @@
+{
+  "_comment_target": "10-video single-GPU sanity. Strips out FSDP entirely so we can validate end-to-end on a known-small dataset. Legacy render path (no embodiment adapter, no cross-attn). Use to verify training actually progresses (loss drops, gates move, checkpoint saves) before committing to multi-GPU FSDP.",
+
+  "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+  "dataset_base_path": "data_wan_1k",
+  "metadata_csv": "data_wan_1k/train_metadata_10.csv",
+  "output_dir": "./checkpoints/wan_render_drrobot_1k_10vids",
+
+  "num_frames": 17,
+  "height": 240,
+  "width": 432,
+
+  "precompute_cache_path": "data_wan_1k/precompute_cache_10vids.pt",
+
+  "dataset_repeat": 1,
+  "num_epochs": 10,
+  "save_every_n_epochs": 1,
+
+  "learning_rate": 2e-05,
+  "lr_scheduler": "cosine_warmup",
+  "lr_warmup_steps": 20,
+  "lr_min_ratio": 0.0,
+  "weight_decay": 0.01,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+
+  "trainable": "render_only",
+  "unfreeze_last_n_blocks": 0,
+  "disable_render_gate": false,
+
+  "max_sequence_length": 256,
+  "mixed_precision": "bf16",
+  "num_workers": 2,
+  "log_every_n_steps": 1,
+
+  "condition_usage_sanity_samples": 0,
+  "render_dropout_prob": 0.0,
+
+  "lambda_tracks": 0.0,
+  "ref_frame": 0,
+  "max_query_points": 128,
+
+  "ignore_prompts": true,
+
+  "use_embodiment_adapter": false,
+  "embodiment_kwargs": null,
+
+  "wandb_project": "wan_flow_drrobot",
+  "wandb_run_name": "1k_10vids_singlegpu_legacy",
+  "wandb_mode": "online",
+
+  "single_process": true
+}

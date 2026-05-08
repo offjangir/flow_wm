@@ -19,6 +19,7 @@ Multi-GPU (optional)::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -110,6 +111,8 @@ def condition_usage_sanity(
         image = c["image_embeds"].to(device=device, dtype=dtype, non_blocking=True)
         rr = c["render_latents"].to(device=device, dtype=dtype, non_blocking=True)
         rw = c_wrong["render_latents"].to(device=device, dtype=dtype, non_blocking=True)
+        ar = c["actions"].to(device=device, dtype=dtype, non_blocking=True).unsqueeze(0) if "actions" in c else None
+        aw = c_wrong["actions"].to(device=device, dtype=dtype, non_blocking=True).unsqueeze(0) if "actions" in c_wrong else None
 
         noise = torch.randn_like(clean)
         t_idx = torch.randint(0, len(scheduler.timesteps), (1,), generator=g)
@@ -127,22 +130,24 @@ def condition_usage_sanity(
         # run between training epochs. The autocast wrapper is sufficient
         # for forward consistency.
         with torch.amp.autocast(device_type=device.type, dtype=dtype):
-            pred_right = model(
-                hidden_states=latent_in,
-                timestep=t_batch,
-                encoder_hidden_states=prompt,
-                encoder_hidden_states_image=image,
-                render_latents=rr,
-                return_dict=False,
-            )[0]
-            pred_wrong = model(
-                hidden_states=latent_in,
-                timestep=t_batch,
-                encoder_hidden_states=prompt,
-                encoder_hidden_states_image=image,
-                render_latents=rw,
-                return_dict=False,
-            )[0]
+            kw_right = dict(
+                hidden_states=latent_in, timestep=t_batch,
+                encoder_hidden_states=prompt, encoder_hidden_states_image=image,
+                render_latents=rr, return_dict=False,
+            )
+            if ar is not None:
+                kw_right["actions"] = ar
+            pred_right = model(**kw_right)[0]
+            kw_wrong = dict(
+                hidden_states=latent_in, timestep=t_batch,
+                encoder_hidden_states=prompt, encoder_hidden_states_image=image,
+                render_latents=rw, return_dict=False,
+            )
+            # Pair the wrong render with the wrong actions so the contrast
+            # is across the *full* embodiment conditioning, not split.
+            if aw is not None:
+                kw_wrong["actions"] = aw
+            pred_wrong = model(**kw_wrong)[0]
         l_right = float(F.mse_loss(pred_right[:, :, 1:].float(), target[:, :, 1:].float()))
         l_wrong = float(F.mse_loss(pred_wrong[:, :, 1:].float(), target[:, :, 1:].float()))
         right_losses.append(l_right)
@@ -310,8 +315,16 @@ def _materialize_meta_submodules(model: torch.nn.Module) -> None:
         return
     for name, m in meta_modules.items():
         m.to_empty(device="cpu", recurse=False)
+        # Note: PyTorch convention is mixed. Some modules expose the public
+        # `reset_parameters` (e.g. nn.Linear, nn.LayerNorm, nn.Conv*); others
+        # use the private `_reset_parameters` (most notably nn.MultiheadAttention).
+        # If we only check the public name we silently fall through to the
+        # zero-everything else-branch for MHA — which zero-inits in_proj_weight
+        # and silently kills cross-attention output. Cost us a day of debugging.
         if hasattr(m, "reset_parameters") and callable(m.reset_parameters):
             m.reset_parameters()
+        elif hasattr(m, "_reset_parameters") and callable(m._reset_parameters):
+            m._reset_parameters()
         else:
             for p in m.parameters(recurse=False):
                 with torch.no_grad():
@@ -595,12 +608,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_path", type=str, required=False, help="HF model id or local Diffusers Wan I2V root.")
     p.add_argument("--dataset_base_path", type=str, required=False)
     p.add_argument("--metadata_csv", type=str, required=False)
+    p.add_argument(
+        "--action_stats_path", type=str, default=None,
+        help="JSON with per-dim mean/std for z-score normalizing the action "
+             "stream (data_wan_1k/action_stats.json). When set, dataset "
+             "samples include normalized 'actions' (num_frames, D).")
+    p.add_argument(
+        "--action_field", type=str, default="state",
+        help="Which field in actions/<scene>.npz to use ('state' = 8-d "
+             "joint+gripper; 'action' = 7-d cmd-target+gripper).")
     p.add_argument("--output_dir", type=str, default="./checkpoints/wan_render")
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--width", type=int, default=832)
     p.add_argument("--dataset_repeat", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=1e-4)
+    p.add_argument(
+        "--gate_lr_multiplier", type=float, default=10.0,
+        help="LR multiplier for zero-init params. See train_fsdp.py for details.",
+    )
     p.add_argument(
         "--lr_scheduler",
         type=str,
@@ -748,6 +774,24 @@ def parse_args() -> argparse.Namespace:
              "bank + per-block cross-attn adapters + decoupled AdaLN deltas. Identity "
              "at init. See ARCHITECTURE_REVIEW.md §4.1.",
     )
+    p.add_argument(
+        "--legacy_render_variant",
+        type=str,
+        default="egowm",
+        choices=("egowm", "v1", "v2"),
+        help="Which legacy (non-embodiment-adapter) variant: 'egowm' "
+             "(per-token spatial, no actions, no gate), 'v1' (BACKWARD-COMPAT "
+             "pooled + fuse + scalar gate), or 'v2' (NEW, "
+             "ActionConditionedTembAdapter, per-token cross-attn over actions, "
+             "zero-init out_proj, no gates). See train_fsdp.py for details.",
+    )
+    p.add_argument(
+        "--v2_adapter_kwargs",
+        type=lambda s: json.loads(s) if isinstance(s, str) else s,
+        default=None,
+        help="JSON dict forwarded to ActionConditionedTembAdapter when "
+             "--legacy_render_variant=v2. Required key: action_dim.",
+    )
     if defaults:
         p.set_defaults(**{k: v for k, v in defaults.items() if k != "config"})
     args = p.parse_args(remaining)
@@ -756,12 +800,13 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-_PRECOMPUTE_CACHE_VERSION = 1
+_PRECOMPUTE_CACHE_VERSION = 2
 
 
 def _compute_precompute_key(
     *, model_path, rows, base_path, num_frames, height, width,
-    max_seq_len, ignore_prompts, has_tracks,
+    max_seq_len, ignore_prompts, has_tracks, has_actions=False,
+    action_field="state", action_stats_path="",
 ) -> str:
     """Stable hash of every input that affects ``_precompute_embeddings`` output.
 
@@ -780,8 +825,20 @@ def _compute_precompute_key(
         "max_seq_len": int(max_seq_len),
         "ignore_prompts": bool(ignore_prompts),
         "has_tracks": bool(has_tracks),
+        "has_actions": bool(has_actions),
+        "action_field": str(action_field) if has_actions else "",
         "n_rows": len(rows),
     }, sort_keys=True).encode())
+    if has_actions and action_stats_path:
+        # Stats file mtime/size folded in so re-normalizing (e.g. recomputing
+        # mean/std on a different split) invalidates the cache.
+        try:
+            _ast = os.stat(action_stats_path)
+            h.update(json.dumps([
+                "action_stats", str(action_stats_path), _ast.st_size, _ast.st_mtime,
+            ], default=str).encode())
+        except OSError:
+            h.update(b"action_stats:missing")
 
     def _stat(p_rel: str) -> tuple:
         if not p_rel:
@@ -793,11 +850,45 @@ def _compute_precompute_key(
         except OSError:
             return (p, -1, -1.0)
 
+    cols = ["video", "render", "tracks"]
+    if has_actions:
+        cols.append("actions")
     for r in rows:
-        for col in ("video", "render", "tracks"):
+        for col in cols:
             h.update(json.dumps([col, _stat(r.get(col, ""))], default=str).encode())
         h.update(("\n" + str(r.get("prompt", ""))).encode("utf-8", errors="replace"))
     return h.hexdigest()
+
+
+@contextlib.contextmanager
+def _disable_fsdp_cpu_ram_efficient_loading():
+    """Suspend ``FSDP_CPU_RAM_EFFICIENT_LOADING`` for the duration of the block.
+
+    When ``fsdp_cpu_ram_efficient_loading: true`` is set in the accelerate
+    YAML, accelerate exports ``FSDP_CPU_RAM_EFFICIENT_LOADING=1``. transformers'
+    ``from_pretrained`` honours that flag by skipping actual weight materialisation
+    on every non-rank-0 process — leaving those ranks with random/uninitialised
+    parameters. That's the desired behaviour later on the DiT (FSDP broadcasts
+    sharded weights from rank 0 during ``accelerator.prepare``), but it silently
+    breaks any standalone encoder load (UMT5, CLIP) the precompute does on every
+    rank: ranks 1..N produce NaN embeddings.
+
+    Use this context manager around encoder ``from_pretrained`` calls so every
+    rank loads real weights, then restore the env var so FSDP wrap of the DiT
+    still gets the RAM-efficient path.
+    """
+    keys = ("FSDP_CPU_RAM_EFFICIENT_LOADING", "ACCELERATE_FSDP_CPU_RAM_EFFICIENT_LOADING")
+    saved = {k: os.environ.get(k) for k in keys}
+    for k in keys:
+        os.environ.pop(k, None)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _precompute_embeddings(
@@ -805,6 +896,10 @@ def _precompute_embeddings(
     encoder_dtype: torch.dtype = torch.bfloat16,
     ignore_prompts: bool = False,
     cache_path=None,
+    *,
+    rows=None,
+    safe_loading: bool = False,
+    save_cache: bool = True,
 ):
     """
     Load each encoder **directly to GPU** one at a time via ``device_map``.
@@ -834,19 +929,45 @@ def _precompute_embeddings(
     from world_model.wan_flow.model import WanVAEChunkedEncode
 
     root = model_path.rstrip("/")
-    rows = dataset.rows
+    # `rows` override: lets the FSDP sharded wrapper feed each rank its slice
+    # without needing a full sub-dataset.  Falls back to dataset.rows when None.
+    if rows is None:
+        rows = dataset.rows
     n = len(rows)
     dev_str = str(device)
 
+    # If ``root`` is a HuggingFace repo id (e.g. "Wan-AI/Wan2.1-I2V-..."), resolve
+    # it to the local snapshot path. transformers' tokenizer init calls
+    # ``model_info(repo_id)`` for its mistral-regex patch whenever the path is
+    # NOT recognised as local — that API hit is anonymous-rate-limited (1000 req
+    # / 5 min) and breaks instantly under 4 ranks × many encoder loads. Passing
+    # a local path makes ``is_local=True`` so the patch fast-paths without the
+    # round-trip. Files must already be in the HF cache.
+    if not os.path.isdir(root):
+        try:
+            from huggingface_hub import snapshot_download
+            root = snapshot_download(root, local_files_only=True)
+            print(f"[precompute] resolved HF repo id → local snapshot: {root}")
+        except Exception as exc:
+            print(f"[precompute] WARN: could not resolve {root!r} to local snapshot ({exc}); "
+                  f"falling back to repo id (may hit HF rate limit)")
+
     # ── Cache: short-circuit if a valid on-disk cache exists ───────────────
+    # When `rows` was explicitly overridden (sharded mode), skip the cache
+    # check — the caller computes the FULL-dataset cache key and handles
+    # read/write at its level.  Otherwise the cache key would be wrong
+    # (covers only this rank's slice).
     cache_key = None
     cache_path = Path(cache_path) if cache_path else None
-    if cache_path is not None:
+    if cache_path is not None and rows is dataset.rows:
         cache_key = _compute_precompute_key(
             model_path=root, rows=rows, base_path=dataset.base_path,
             num_frames=num_frames, height=height, width=width,
             max_seq_len=max_seq_len, ignore_prompts=ignore_prompts,
             has_tracks=dataset.has_tracks,
+            has_actions=getattr(dataset, "has_actions", False),
+            action_field=getattr(dataset, "action_field", "state"),
+            action_stats_path=getattr(dataset, "_action_stats_path", "") or "",
         )
         if cache_path.is_file():
             print(f"[precompute] checking on-disk cache: {cache_path}")
@@ -880,13 +1001,32 @@ def _precompute_embeddings(
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(root, subfolder="scheduler")
     video_processor = VideoProcessor(vae_scale_factor=8)
 
-    print(f"[precompute 1/3] text encoder → GPU, encoding {n} prompts ...")
-    tokenizer = AutoTokenizer.from_pretrained(root, subfolder="tokenizer")
-    text_encoder = UMT5EncoderModel.from_pretrained(
-        root, subfolder="text_encoder", torch_dtype=encoder_dtype,
-        device_map=dev_str, low_cpu_mem_usage=True,
-    )
-    text_encoder.eval()
+    if ignore_prompts:
+        print(f"[precompute 1/3] text encoder → GPU, {n}× empty prompts (ignore_prompts) ...")
+    else:
+        print(f"[precompute 1/3] text encoder → GPU, encoding {n} prompts ...")
+    if safe_loading:
+        # Plain CPU load + .to(device): avoids the from_pretrained(device_map=cuda:N)
+        # path which silently drops weights to CPU on non-rank-0 ranks under
+        # `fsdp_cpu_ram_efficient_loading=true`. Also suspend the env var so
+        # transformers actually materialises weights on every rank (otherwise
+        # ranks 1..N get uninitialised UMT5 → NaN embeddings).
+        # Use T5TokenizerFast directly (the class declared in tokenizer_config.json)
+        # so we avoid AutoTokenizer's AutoConfig probe — the Wan repo has no
+        # top-level config.json, and that probe surfaces as a misleading
+        # "outgoing traffic disabled" error when local_files_only is forced on.
+        from transformers import T5TokenizerFast
+        with _disable_fsdp_cpu_ram_efficient_loading():
+            tokenizer = T5TokenizerFast.from_pretrained(root, subfolder="tokenizer")
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                root, subfolder="text_encoder", torch_dtype=encoder_dtype,
+            ).to(device).eval()
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(root, subfolder="tokenizer")
+        text_encoder = UMT5EncoderModel.from_pretrained(
+            root, subfolder="text_encoder", torch_dtype=encoder_dtype,
+            device_map=dev_str, low_cpu_mem_usage=True,
+        ).eval()
     all_prompt_embeds = []
     with torch.no_grad():
         for i, row in enumerate(rows):
@@ -915,15 +1055,21 @@ def _precompute_embeddings(
     print("[precompute 1/3] done")
 
     print(f"[precompute 2/3] image encoder → GPU, encoding {n} first frames ...")
-    img_proc = AutoImageProcessor.from_pretrained(root, subfolder="image_processor")
-    image_encoder = CLIPVisionModel.from_pretrained(
-        root, subfolder="image_encoder", torch_dtype=encoder_dtype,
-        device_map=dev_str, low_cpu_mem_usage=True,
-    )
-    image_encoder.eval()
+    if safe_loading:
+        with _disable_fsdp_cpu_ram_efficient_loading():
+            img_proc = AutoImageProcessor.from_pretrained(root, subfolder="image_processor")
+            image_encoder = CLIPVisionModel.from_pretrained(
+                root, subfolder="image_encoder", torch_dtype=encoder_dtype,
+            ).to(device).eval()
+    else:
+        img_proc = AutoImageProcessor.from_pretrained(root, subfolder="image_processor")
+        image_encoder = CLIPVisionModel.from_pretrained(
+            root, subfolder="image_encoder", torch_dtype=encoder_dtype,
+            device_map=dev_str, low_cpu_mem_usage=True,
+        ).eval()
     all_image_embeds = []
     with torch.no_grad():
-        for i, row in enumerate(rows):
+        for i, row in enumerate(tqdm(rows, desc="[precompute 2/3] image enc", unit="vid")):
             frames = _load_target(row)
             pv = img_proc(images=frames[0], return_tensors="pt").pixel_values
             pv = pv.to(device=device, dtype=encoder_dtype)
@@ -944,7 +1090,7 @@ def _precompute_embeddings(
 
     all_latents, all_render_latents, all_conditions = [], [], []
     with torch.no_grad():
-        for i, row in enumerate(rows):
+        for i, row in enumerate(tqdm(rows, desc="[precompute 3/3] VAE", unit="vid")):
             frames = _load_target(row)
             render_frames = _load_render(row)
 
@@ -1003,6 +1149,28 @@ def _precompute_embeddings(
     else:
         all_tracks = [None] * n
 
+    # Optional per-sample action conditioning: pre-load + temporally subsample
+    # once so the train loop just indexes into pre-tensorized actions.
+    all_actions: list = []
+    if getattr(dataset, "has_actions", False):
+        from world_model.wan_flow.data import _load_actions_npz
+        a_field = getattr(dataset, "action_field", "state")
+        a_stats = getattr(dataset, "action_stats", None)
+        for row in rows:
+            a = row.get("actions", "") or ""
+            if not a:
+                all_actions.append(None)
+                continue
+            apath = a if os.path.isabs(a) else os.path.join(dataset.base_path, a)
+            arr = _load_actions_npz(
+                apath, num_frames, stats=a_stats, field=a_field,
+            )                                                  # (num_frames, D)
+            all_actions.append(torch.from_numpy(arr))
+        n_with = sum(1 for a in all_actions if a is not None)
+        print(f"[precompute actions] {n_with}/{n} samples have actions")
+    else:
+        all_actions = [None] * n
+
     cache = []
     for i in range(n):
         sample = {
@@ -1015,9 +1183,14 @@ def _precompute_embeddings(
         if all_tracks[i] is not None:
             sample["gt_xy"] = all_tracks[i]["gt_xy"]
             sample["gt_vis"] = all_tracks[i]["gt_vis"]
+        if all_actions[i] is not None:
+            sample["actions"] = all_actions[i]
         cache.append(sample)
 
-    if cache_path is not None and cache_key is not None:
+    # Skip the cache write when the caller is shard-mode (rows overridden) or
+    # explicitly disabled it.  In sharded mode the FULL-dataset cache is
+    # written by the gather wrapper, not here.
+    if cache_path is not None and cache_key is not None and save_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
         try:
@@ -1099,6 +1272,8 @@ def main() -> None:
         height=args.height,
         width=args.width,
         repeat=1,
+        action_stats_path=args.action_stats_path,
+        action_field=args.action_field,
     )
     try:
         dataset.assert_local_files_exist()
@@ -1137,6 +1312,8 @@ def main() -> None:
         torch_dtype=dit_load_dtype,
         render_encoder_kwargs={},
         use_embodiment_adapter=bool(args.use_embodiment_adapter),
+        legacy_render_variant=getattr(args, "legacy_render_variant", "egowm"),
+        v2_adapter_kwargs=getattr(args, "v2_adapter_kwargs", None),
     )
     if local_transformer:
         dit = WanTransformerRenderConditioned.from_pretrained(os.path.join(root, "transformer"), **tkw)
@@ -1166,14 +1343,40 @@ def main() -> None:
         if args.use_embodiment_adapter:
             for p_ in dit.embodiment.parameters():
                 p_.requires_grad = True
+        elif getattr(dit, "legacy_render_variant", "egowm") == "v2":
+            # v2: ActionConditionedTembAdapter is the entire trainable
+            # render-conditioner; no render_encoder / render_fuse / render_gate.
+            for p_ in dit.action_adapter.parameters():
+                p_.requires_grad = True
         else:
+            # Legacy egowm / v1: render_encoder always trainable.
             for p_ in dit.render_encoder.parameters():
                 p_.requires_grad = True
-            for p_ in dit.render_fuse.parameters():
-                p_.requires_grad = True
-            dit.render_gate.requires_grad = True
+            if getattr(dit, "legacy_render_variant", "egowm") == "v1":
+                for p_ in dit.render_fuse.parameters():
+                    p_.requires_grad = True
+                dit.render_gate.requires_grad = True
         if use_tracks_loss:
             for p_ in dit.tracks_head.parameters():
+                p_.requires_grad = True
+
+        # Mirrors the same logic in train_fsdp.py: unfreeze the last N
+        # transformer blocks plus the head (norm_out, proj_out) and the
+        # condition_embedder.time_proj so the AdaLN modulation path is
+        # trainable. Without this, ``unfreeze_last_n_blocks`` in the config
+        # is silently ignored on the single-process path → on render-dropout
+        # steps the only trainable params (render_encoder) are skipped,
+        # leaving the loss with no grad_fn and crashing backward.
+        if getattr(args, "unfreeze_last_n_blocks", 0) > 0:
+            n_blocks = args.unfreeze_last_n_blocks
+            for block in dit.blocks[-n_blocks:]:
+                for p_ in block.parameters():
+                    p_.requires_grad = True
+            for p_ in dit.norm_out.parameters():
+                p_.requires_grad = True
+            for p_ in dit.proj_out.parameters():
+                p_.requires_grad = True
+            for p_ in dit.condition_embedder.time_proj.parameters():
                 p_.requires_grad = True
     else:
         for p_ in dit.parameters():
@@ -1191,9 +1394,13 @@ def main() -> None:
             for adapter in dit.embodiment.adapters.values():
                 adapter.gate.requires_grad = False
         else:
-            with torch.no_grad():
-                dit.render_gate.data.fill_(1.0)
-            dit.render_gate.requires_grad = False
+            if getattr(dit, "legacy_render_variant", "egowm") == "v1":
+                with torch.no_grad():
+                    dit.render_gate.data.fill_(1.0)
+                dit.render_gate.requires_grad = False
+            else:
+                print("[train] disable_render_gate is a NO-OP for the EgoWM-style "
+                      "legacy variant (no gate exists).")
 
     trainable = [p for p in dit.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
@@ -1201,9 +1408,11 @@ def main() -> None:
     n_th = sum(p.numel() for p in dit.tracks_head.parameters())
     if args.use_embodiment_adapter:
         n_emb = sum(p.numel() for p in dit.embodiment.parameters())
+        # render_adaln_gate / state_adaln_gate are per-channel (D,);
+        # report mean abs as a single scalar summary.
         gate_str = (
-            f"render_adaln_gate={float(dit.embodiment.render_adaln_gate.float().item()):.4g} "
-            f"state_adaln_gate={float(dit.embodiment.state_adaln_gate.float().item()):.4g}"
+            f"render_adaln_gate={float(dit.embodiment.render_adaln_gate.detach().float().abs().mean().item()):.4g} "
+            f"state_adaln_gate={float(dit.embodiment.state_adaln_gate.detach().float().abs().mean().item()):.4g}"
         )
         accelerator.print(
             f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
@@ -1212,12 +1421,28 @@ def main() -> None:
             f"use_tracks_loss={use_tracks_loss}  disable_render_gate={args.disable_render_gate}  {gate_str}"
         )
     else:
-        accelerator.print(
-            f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
-            f"({100*n_trainable/n_total:.2f}%); tracks_head: {n_th/1e6:.2f}M  "
-            f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}  "
-            f"disable_render_gate={args.disable_render_gate}  render_gate={float(dit.render_gate.detach().float().item()):.4g}"
-        )
+        variant = getattr(dit, "legacy_render_variant", "egowm")
+        if variant == "v2":
+            n_aa = sum(p.numel() for p in dit.action_adapter.parameters())
+            accelerator.print(
+                f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
+                f"({100*n_trainable/n_total:.2f}%); action_adapter: {n_aa/1e6:.2f}M "
+                f"(legacy variant='v2', no gates); tracks_head: {n_th/1e6:.2f}M  "
+                f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
+            )
+        else:
+            n_re = sum(p.numel() for p in dit.render_encoder.parameters())
+            gate_str = (
+                f"render_gate={float(dit.render_gate.detach().float().item()):.4g}"
+                if variant == "v1" else "no gate"
+            )
+            accelerator.print(
+                f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
+                f"({100*n_trainable/n_total:.2f}%); render_encoder: {n_re/1e6:.2f}M "
+                f"(legacy variant={variant!r}); tracks_head: {n_th/1e6:.2f}M  "
+                f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}  "
+                f"disable_render_gate={args.disable_render_gate}  {gate_str}"
+            )
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     n_samples = len(embed_cache)
@@ -1323,6 +1548,14 @@ def main() -> None:
                 prompt_embeds = cached["prompt_embeds"].to(device=device, dtype=dtype)
                 image_embeds = cached["image_embeds"].to(device=device, dtype=dtype)
                 condition = cached["condition"].to(device=device, dtype=dtype)
+                # Optional 8-d (or 7-d) per-frame action stream — fed into the
+                # action-aware adapter when the embodiment module's
+                # ``use_action_aware_adaln`` is on.
+                actions: Optional[torch.Tensor] = None
+                if "actions" in cached:
+                    actions = cached["actions"].to(
+                        device=device, dtype=dtype,
+                    ).unsqueeze(0)                                   # (1, T, D)
 
                 # Tracks supervision (optional).
                 gt_xy: Optional[torch.Tensor] = None
@@ -1374,6 +1607,8 @@ def main() -> None:
                     render_latents=None if drop_render_step else render_latents,
                     return_dict=False,
                 )
+                if actions is not None and not drop_render_step:
+                    forward_kwargs["actions"] = actions
                 if query_xy is not None and not drop_render_step:
                     forward_kwargs["query_xy"] = query_xy
                     forward_kwargs["track_T"] = int(gt_xy.shape[1])
@@ -1570,29 +1805,48 @@ def main() -> None:
             os.makedirs(save_dir, exist_ok=True)
             unwrapped = accelerator.unwrap_model(dit)
             if args.trainable == "render_only":
+                # Filter the FULL state_dict by trainable-key prefix. Mirrors
+                # the train_fsdp.py save logic (keep_prefixes), so train.py
+                # and train_fsdp.py produce identical checkpoint layouts and
+                # any code path can load either. Centralizes which keys are
+                # "render_only-trainable" so we don't have to keep model-side
+                # adds in sync with this save block.
+                full_state = unwrapped.state_dict()
                 if args.use_embodiment_adapter:
-                    render_state = {
-                        f"embodiment.{k}": v.detach().cpu()
-                        for k, v in unwrapped.embodiment.state_dict().items()
-                    }
+                    keep_prefixes = ["embodiment."]
+                    keep_exact: set = set()
+                elif getattr(unwrapped, "legacy_render_variant", "egowm") == "v2":
+                    # v2: ActionConditionedTembAdapter at `action_adapter.*`.
+                    keep_prefixes = ["action_adapter."]
+                    keep_exact = set()
                 else:
-                    render_state = {
-                        **{f"render_encoder.{k}": v.detach().cpu()
-                           for k, v in unwrapped.render_encoder.state_dict().items()},
-                        **{f"render_fuse.{k}": v.detach().cpu()
-                           for k, v in unwrapped.render_fuse.state_dict().items()},
-                        "render_gate": unwrapped.render_gate.detach().cpu(),
-                    }
+                    keep_prefixes = ["render_encoder."]
+                    keep_exact = set()
+                    if getattr(unwrapped, "legacy_render_variant", "egowm") == "v1":
+                        keep_prefixes.append("render_fuse.")
+                        keep_exact.add("render_gate")
                 if use_tracks_loss:
-                    render_state.update({
-                        f"tracks_head.{k}": v.detach().cpu()
-                        for k, v in unwrapped.tracks_head.state_dict().items()
-                    })
+                    keep_prefixes.append("tracks_head.")
+                if getattr(args, "unfreeze_last_n_blocks", 0) > 0:
+                    n_blocks = args.unfreeze_last_n_blocks
+                    n_total_blocks = len(unwrapped.blocks)
+                    for i in range(n_total_blocks - n_blocks, n_total_blocks):
+                        keep_prefixes.append(f"blocks.{i}.")
+                    keep_prefixes.append("norm_out.")
+                    keep_prefixes.append("proj_out.")
+                    keep_prefixes.append("condition_embedder.time_proj.")
+                kp = tuple(keep_prefixes)
+                render_state = {
+                    k: v.detach().cpu()
+                    for k, v in full_state.items()
+                    if k.startswith(kp) or k in keep_exact
+                }
                 ckpt_path = os.path.join(save_dir, "render_conditioner.pt")
                 torch.save(render_state, ckpt_path)
                 n_saved = sum(v.numel() for v in render_state.values())
                 accelerator.print(
-                    f"Saved render conditioner ({n_saved/1e6:.1f}M params) to {ckpt_path}"
+                    f"Saved render conditioner ({n_saved/1e6:.1f}M params, "
+                    f"{len(render_state)} tensors) to {ckpt_path}"
                 )
             else:
                 unwrapped.save_pretrained(save_dir)

@@ -8,7 +8,7 @@ fsdp_config:
   # The repeated block class inside the Wan DiT
   fsdp_transformer_layer_cls_to_wrap: WanTransformerBlock
   # Offload params to CPU when not in use (set false if enough GPU mem)
-  fsdp_offload_params: true
+  fsdp_offload_params: false 
   
   # Keep parameters in bf16 during FSDP communication
   fsdp_forward_prefetch: true
@@ -27,5 +27,5 @@ mixed_precision: 'no'
 # Set num_processes to match your GPU count, or override via CLI:
 #   accelerate launch --num_processes <N> --config_file configs/accelerate_fsdp.yaml ...
 num_machines: 1
-num_processes: 4
+num_processes: 6
 main_training_function: main

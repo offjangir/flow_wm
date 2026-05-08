@@ -10,15 +10,20 @@
 #
 # Env vars (all optional):
 #   NUM_GPUS=4              GPU count for accelerate launch
+#   CUDA_VISIBLE_DEVICES=  Comma-separated physical GPU ids (e.g. 0,2,5,6 on
+#                           a shared node). Must list NUM_GPUS devices.
 #   CONFIG=...              training config JSON
 #                           (default: configs/train_drrobot_1k_aa_4xa6000.json)
 #   ACCEL_CONFIG=...        accelerate config YAML
 #                           (default: configs/accelerate_fsdp.yaml)
 #   CONDA_ENV=dr            conda env to activate
+#   CONDA_SH=...            full path to conda.sh (optional; auto-detected)
+#   CONDA_ROOT=...          conda base prefix containing etc/profile.d/conda.sh (optional)
 #
 # Usage:
 #   ./scripts/launch_train_1k_aa_4xa6000.sh
 #   NUM_GPUS=2 ./scripts/launch_train_1k_aa_4xa6000.sh
+#   CUDA_VISIBLE_DEVICES=0,2,5,6 NUM_GPUS=4 ./scripts/launch_train_1k_aa_4xa6000.sh
 
 set -euo pipefail
 
@@ -35,20 +40,29 @@ CONDA_ENV="${CONDA_ENV:-dr}"
 
 # ─── conda activate ─────────────────────────────────────────────────────────
 # Source conda.sh so `conda activate` works in non-interactive shells.
-CONDA_SH=""
-for candidate in \
-    "$HOME/miniconda3/etc/profile.d/conda.sh" \
-    "$HOME/anaconda3/etc/profile.d/conda.sh" \
-    "/opt/conda/etc/profile.d/conda.sh"; do
-    if [[ -f "$candidate" ]]; then
-        CONDA_SH="$candidate"
-        break
-    fi
-done
-if [[ -z "$CONDA_SH" ]]; then
-    echo "ERROR: cannot find conda.sh; set CONDA_SH manually if conda lives elsewhere." >&2
+CONDA_SH_RESOLVED="${CONDA_SH:-}"
+if [[ -z "$CONDA_SH_RESOLVED" && -n "${CONDA_ROOT:-}" ]]; then
+    CONDA_SH_RESOLVED="$CONDA_ROOT/etc/profile.d/conda.sh"
+fi
+if [[ -z "$CONDA_SH_RESOLVED" ]]; then
+    for candidate in \
+        "$HOME/miniconda3/etc/profile.d/conda.sh" \
+        "$HOME/anaconda3/etc/profile.d/conda.sh" \
+        "$HOME/mambaforge/etc/profile.d/conda.sh" \
+        "$HOME/scratchhbharad2/users/$(id -un)/miniconda3/etc/profile.d/conda.sh" \
+        "$HOME/scratchhbharad2/users/$(id -un)/anaconda3/etc/profile.d/conda.sh" \
+        "/opt/conda/etc/profile.d/conda.sh"; do
+        if [[ -f "$candidate" ]]; then
+            CONDA_SH_RESOLVED="$candidate"
+            break
+        fi
+    done
+fi
+if [[ ! -f "$CONDA_SH_RESOLVED" ]]; then
+    echo "ERROR: cannot find conda.sh; set CONDA_SH or CONDA_ROOT, or install conda under ~/miniconda3." >&2
     exit 1
 fi
+CONDA_SH="$CONDA_SH_RESOLVED"
 # shellcheck disable=SC1090
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
@@ -74,6 +88,9 @@ echo "[data] $METADATA_CSV  ($N_ROWS rows)"
 
 # ─── launch ─────────────────────────────────────────────────────────────────
 echo "[launch] FSDP training on ${NUM_GPUS} GPU(s)"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    echo "         CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+fi
 echo "         config        : $CONFIG"
 echo "         accelerate cfg: $ACCEL_CONFIG"
 echo

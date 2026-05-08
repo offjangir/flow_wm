@@ -56,31 +56,48 @@ def extract_one(traj_path: Path, out_path: Path) -> Dict[str, int]:
         cart_obs  = _to_f32(f["observation/robot_state/cartesian_position"][:])  # (T, 6)
         joint_vel = _to_f32(f["observation/robot_state/joint_velocities"][:])    # (T, 7)
 
-        # Action (commanded target) ────────────────────────────────────────
-        tgt_cart  = _to_f32(f["action/target_cartesian_position"][:])            # (T, 6)
-        tgt_grip  = _to_f32(f["action/target_gripper_position"][:])              # (T,)
+        # Action (commanded target) — optional. A handful of older DROID lab
+        # recordings lack ``action/target_cartesian_position`` entirely but
+        # still have valid state streams. Save state regardless so 8-d
+        # joint+gripper conditioning works on every scene.
+        if (
+            "action/target_cartesian_position" in f
+            and "action/target_gripper_position" in f
+        ):
+            tgt_cart = _to_f32(f["action/target_cartesian_position"][:])         # (T, 6)
+            tgt_grip = _to_f32(f["action/target_gripper_position"][:])           # (T,)
+        else:
+            tgt_cart = None
+            tgt_grip = None
 
     T = joint_pos.shape[0]
-    if not (gripper.shape[0] == cart_obs.shape[0] == tgt_cart.shape[0] == tgt_grip.shape[0] == T):
+    if not (gripper.shape[0] == cart_obs.shape[0] == T):
         raise ValueError(
-            f"{traj_path}: inconsistent T across streams "
-            f"(joint={T}, grip={gripper.shape[0]}, cart={cart_obs.shape[0]}, "
-            f"tgt_cart={tgt_cart.shape[0]}, tgt_grip={tgt_grip.shape[0]})"
+            f"{traj_path}: inconsistent T across state streams "
+            f"(joint={T}, grip={gripper.shape[0]}, cart={cart_obs.shape[0]})"
         )
 
-    state  = np.concatenate([joint_pos, gripper[:, None]], axis=1).astype(np.float32)  # (T, 8)
-    action = np.concatenate([tgt_cart, tgt_grip[:, None]], axis=1).astype(np.float32)  # (T, 7)
+    state = np.concatenate([joint_pos, gripper[:, None]], axis=1).astype(np.float32)  # (T, 8)
+
+    arrays = {
+        "state": state,
+        "cartesian_position": cart_obs,
+        "joint_velocity": joint_vel,
+        "gripper_position": gripper.astype(np.float32),
+    }
+    if tgt_cart is not None and tgt_grip is not None:
+        if not (tgt_cart.shape[0] == tgt_grip.shape[0] == T):
+            raise ValueError(
+                f"{traj_path}: action stream length mismatch "
+                f"(tgt_cart={tgt_cart.shape[0]}, tgt_grip={tgt_grip.shape[0]}, T={T})"
+            )
+        arrays["action"] = np.concatenate(
+            [tgt_cart, tgt_grip[:, None]], axis=1
+        ).astype(np.float32)  # (T, 7)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_path,
-        state=state,
-        action=action,
-        cartesian_position=cart_obs,
-        joint_velocity=joint_vel,
-        gripper_position=gripper.astype(np.float32),
-    )
-    return {"T": T}
+    np.savez_compressed(out_path, **arrays)
+    return {"T": T, "has_action": "action" in arrays}
 
 
 def discover_scenes(data_root: Path) -> List[Path]:

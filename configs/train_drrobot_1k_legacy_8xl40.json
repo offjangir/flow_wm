@@ -1,10 +1,10 @@
 {
-  "_comment_target": "Render-conditioned Wan I2V world-model on the 882-clip droid_1k dataset, 4x A6000 (48 GB each) under FSDP. Action-aware AdaLN in bypass mode (action_dim: null) — actions exist in the CSV but the data loader does not yet pass them through.",
+  "_comment_target": "Legacy render path (use_embodiment_adapter=false) on 8x L40 (48 GB each), full 891-clip droid_1k dataset, FSDP. The legacy path is simpler — render_encoder (Conv3d) → render_fuse (Linear) → render_gate (scalar, init=0.1, learnable) → added per-token to temb. No cross-attn, no spatial KV bank, no per-block adapters. Trainable params ≈ render_encoder + render_fuse + render_gate + last 8 unfrozen blocks + tracks_head (~600M). Sharded across 8 GPUs (vs 4-way), so per-rank memory is half what the original 4xA6000 setup needed.",
 
   "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
   "dataset_base_path": "data_wan_1k",
   "metadata_csv": "data_wan_1k/train_metadata_train.csv",
-  "output_dir": "./checkpoints/wan_render_drrobot_1k_aa_4xa6000",
+  "output_dir": "./checkpoints/wan_render_drrobot_1k_legacy_8xl40",
 
   "num_frames": 17,
   "height": 240,
@@ -14,14 +14,14 @@
 
   "dataset_repeat": 1,
   "num_epochs": 30,
-  "save_every_n_epochs": 1,
+  "save_every_n_epochs": 5,
 
   "learning_rate": 2e-05,
   "lr_scheduler": "cosine_warmup",
   "lr_warmup_steps": 200,
   "lr_min_ratio": 0.0,
-  "weight_decay": 0.01,
-  "gradient_accumulation_steps": 2,
+  "weight_decay": 0.001,
+  "gradient_accumulation_steps": 1,
   "max_grad_norm": 1.0,
   "seed": 42,
 
@@ -43,25 +43,11 @@
 
   "ignore_prompts": true,
 
-  "use_embodiment_adapter": true,
-  "embodiment_kwargs": {
-    "num_state_tokens": 8,
-    "state_hidden_dim": 512,
-    "adaln_rank": 512,
-    "adapter_every_k": 8,
-    "adapter_num_heads": 8,
-    "spatial_pool": 4,
-    "use_action_aware_adaln": true,
-    "action_aware_kwargs": {
-      "spatial_pool": 2,
-      "action_dim": null,
-      "hidden_dim": 512,
-      "adaln_rank": 512,
-      "num_heads": 8
-    }
-  },
+  "use_embodiment_adapter": false,
+  "embodiment_kwargs": null,
+  "legacy_render_variant": "v1",
 
   "wandb_project": "wan_flow_drrobot",
-  "wandb_run_name": "1k_aa_bypass_4xa6000_v1",
+  "wandb_run_name": "1k_legacy_8xl40_v1",
   "wandb_mode": "online"
 }

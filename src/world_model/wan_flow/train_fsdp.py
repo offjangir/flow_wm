@@ -16,6 +16,16 @@ Run::
     --model_path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
     --dataset_base_path ./data_wan \
     --metadata_csv ./data_wan/metadata.csv
+
+Continue training from a saved ``render_conditioner.pt`` (new ``run_*`` dir;
+checkpoints named ``epoch_{offset+inner}``)::
+
+  accelerate launch --config_file configs/accelerate_fsdp.yaml \
+    -m world_model.wan_flow.train_fsdp \
+    --config configs/train_drrobot_1k_legacy_8xl40.json \
+    --resume_render_ckpt checkpoints/.../run_.../epoch_29/render_conditioner.pt \
+    --epoch_offset 30 --num_epochs 30 \
+    --wandb_run_name my_run_continue30
 """
 
 from __future__ import annotations
@@ -24,11 +34,12 @@ import argparse
 import json
 import os
 import time
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator, DistributedType
+from accelerate import Accelerator, DistributedType, InitProcessGroupKwargs
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from accelerate.utils import set_seed
 from tqdm.auto import tqdm
@@ -38,6 +49,8 @@ from world_model.wan_flow.model import (
     WanTransformerRenderConditioned,
 )
 from world_model.wan_flow.train import (
+    _PRECOMPUTE_CACHE_VERSION,
+    _compute_precompute_key,
     _precompute_embeddings,
     _setup_run_dir_and_logging,
     build_lr_scheduler,
@@ -46,6 +59,158 @@ from world_model.wan_flow.train import (
     optimizer_step_count,
     save_forward_debug_bundle,
 )
+
+
+def _precompute_embeddings_sharded(
+    accelerator,
+    model_path,
+    dataset,
+    height,
+    width,
+    num_frames,
+    max_seq_len,
+    encoder_dtype,
+    ignore_prompts: bool,
+    cache_path,
+):
+    """
+    Distributed precompute: each rank encodes a contiguous slice of the
+    dataset on its own GPU, then results are all-gathered to construct the
+    full cache.  Cuts wall time ~world_size × vs. the rank-0-only path.
+
+    Why this exists: the original rank-0-only implementation was forced by a
+    `from_pretrained(device_map="cuda:N")` quirk under
+    ``fsdp_cpu_ram_efficient_loading=true`` that drops weights to CPU on
+    non-rank-0 processes.  We sidestep it by passing ``safe_loading=True`` to
+    the inner function, which uses the plain ``.from_pretrained(...).to(device)``
+    path on every rank.
+
+    The on-disk cache key is computed from the FULL row list (so it remains
+    a single shared cache file), but the encode work is parallelised.
+    """
+    import os as _os
+    import torch.distributed as dist
+    from pathlib import Path as _Path
+
+    rank = accelerator.process_index
+    world = accelerator.num_processes
+    rows = dataset.rows
+    n = len(rows)
+    cache_path = _Path(cache_path) if cache_path else None
+
+    # ── 1. Cache hit fast-path: every rank loads the full cache from disk ──
+    cache_key = None
+    if cache_path is not None:
+        cache_key = _compute_precompute_key(
+            model_path=str(model_path).rstrip("/"),
+            rows=rows,
+            base_path=dataset.base_path,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            max_seq_len=max_seq_len,
+            ignore_prompts=ignore_prompts,
+            has_tracks=dataset.has_tracks,
+            has_actions=getattr(dataset, "has_actions", False),
+            action_field=getattr(dataset, "action_field", "state"),
+            action_stats_path=getattr(dataset, "_action_stats_path", "") or "",
+        )
+        if cache_path.is_file():
+            try:
+                blob = torch.load(cache_path, map_location="cpu", weights_only=False)
+                if blob.get("key") == cache_key:
+                    if accelerator.is_main_process:
+                        accelerator.print(
+                            f"[precompute-sharded] HIT  ({len(blob['cache'])} samples, "
+                            f"{cache_path.stat().st_size / 1e9:.2f} GB)  → skipping encoders"
+                        )
+                    accelerator.wait_for_everyone()
+                    return blob["cache"], blob["z_dim"], blob["scheduler"]
+                if accelerator.is_main_process:
+                    accelerator.print(
+                        f"[precompute-sharded] MISS — cache key changed "
+                        f"(stored={blob.get('key', '?')[:16]}…  expected={cache_key[:16]}…)"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                if accelerator.is_main_process:
+                    accelerator.print(
+                        f"[precompute-sharded] cache load failed ({exc}); recomputing"
+                    )
+
+    # ── 2. Cache miss: shard rows contiguously across ranks ────────────────
+    chunk = (n + world - 1) // world
+    start = rank * chunk
+    end = min(start + chunk, n)
+    my_rows = rows[start:end]
+
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[precompute-sharded] {n} samples → {world} ranks, ~{chunk}/rank "
+            f"(rank 0 does rows[{start}:{end}])"
+        )
+    accelerator.print(
+        f"[rank {rank}] encoding rows[{start}:{end}] ({len(my_rows)} samples)"
+    )
+
+    my_cache, z_dim, scheduler = _precompute_embeddings(
+        model_path=model_path,
+        dataset=dataset,
+        device=accelerator.device,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+        max_seq_len=max_seq_len,
+        encoder_dtype=encoder_dtype,
+        ignore_prompts=ignore_prompts,
+        cache_path=None,
+        rows=my_rows,
+        safe_loading=True,
+        save_cache=False,
+    )
+
+    # ── 3. Gather slices → full cache, in original row order ──────────────
+    gathered: list = [None] * world
+    dist.all_gather_object(gathered, my_cache)
+    full_cache: list = []
+    for shard in gathered:
+        full_cache.extend(shard)
+    if len(full_cache) != n:
+        raise RuntimeError(
+            f"[precompute-sharded] gather size mismatch: got {len(full_cache)}, expected {n}"
+        )
+
+    # ── 4. Rank 0 saves to disk ────────────────────────────────────────────
+    if accelerator.is_main_process and cache_path is not None and cache_key is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            torch.save(
+                {
+                    "key": cache_key,
+                    "cache": full_cache,
+                    "z_dim": z_dim,
+                    "scheduler": scheduler,
+                    "version": _PRECOMPUTE_CACHE_VERSION,
+                },
+                tmp,
+            )
+            _os.replace(tmp, cache_path)
+            accelerator.print(
+                f"[precompute-sharded] saved cache → {cache_path} "
+                f"({cache_path.stat().st_size / 1e9:.2f} GB)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            accelerator.print(
+                f"[precompute-sharded] WARN: failed to write cache to {cache_path}: {exc}"
+            )
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    accelerator.wait_for_everyone()
+    return full_cache, z_dim, scheduler
 
 
 def _cast_module_for_fsdp(module: torch.nn.Module, dtype: torch.dtype) -> Dict[str, int]:
@@ -84,8 +249,16 @@ def _materialize_meta_submodules(model: torch.nn.Module) -> int:
 
     for m in meta_modules:
         m.to_empty(device="cpu", recurse=False)
+        # PyTorch convention is mixed: nn.MultiheadAttention only exposes the
+        # private `_reset_parameters`, not the public `reset_parameters`. Without
+        # the elif below we'd fall through to the zero-everything branch and
+        # silently zero MHA's `in_proj_weight` → cross-attn outputs zero →
+        # adapter gates never get gradient. See model.py:reset_zero_gates for
+        # the symptom-level workaround that this elif obviates.
         if hasattr(m, "reset_parameters") and callable(m.reset_parameters):
             m.reset_parameters()
+        elif hasattr(m, "_reset_parameters") and callable(m._reset_parameters):
+            m._reset_parameters()
         else:
             for p in m.parameters(recurse=False):
                 with torch.no_grad():
@@ -94,6 +267,42 @@ def _materialize_meta_submodules(model: torch.nn.Module) -> int:
                 with torch.no_grad():
                     b.zero_()
     return len(meta_modules)
+
+
+@torch.no_grad()
+def _load_resume_render_ckpt(
+    dit: torch.nn.Module, ckpt_path: str, accelerator: Accelerator
+) -> None:
+    """Load a saved ``render_conditioner.pt`` (trainable subset) before FSDP.
+
+    Same layout as inference: ``strict=False`` so only overlapping keys move.
+    All ranks load identically from the shared filesystem.
+    """
+    path = ckpt_path.strip()
+    sd = torch.load(path, map_location="cpu", weights_only=False)
+    target_dtype = next(dit.parameters()).dtype
+    sd_cast = {
+        k: (
+            v.to(dtype=target_dtype)
+            if isinstance(v, torch.Tensor) and v.is_floating_point()
+            else v
+        )
+        for k, v in sd.items()
+    }
+    missing, unexpected = dit.load_state_dict(sd_cast, strict=False)
+    if accelerator.is_main_process:
+        n_ok = len(sd_cast) - len(unexpected)
+        accelerator.print(
+            f"[FSDP train] resume: loaded {n_ok}/{len(sd_cast)} tensors from {path}"
+        )
+        if unexpected:
+            accelerator.print(
+                f"[FSDP train] resume WARN unexpected keys (first 8): {unexpected[:8]}"
+            )
+        if missing:
+            accelerator.print(
+                f"[FSDP train] resume WARN missing keys (first 8): {missing[:8]}"
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,12 +322,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_path", type=str, required=False)
     p.add_argument("--dataset_base_path", type=str, required=False)
     p.add_argument("--metadata_csv", type=str, required=False)
+    p.add_argument(
+        "--action_stats_path", type=str, default=None,
+        help="JSON with per-dim mean/std for z-score normalizing the action "
+             "stream. When set, the dataset returns normalized 'actions' "
+             "(num_frames, D) and the precompute cache stores them.")
+    p.add_argument(
+        "--action_field", type=str, default="state",
+        help="Which field in actions/<scene>.npz to use ('state' = 8-d "
+             "joint+gripper; 'action' = 7-d cmd-target+gripper).")
     p.add_argument("--output_dir", type=str, default="./checkpoints/wan_render_fsdp")
+    p.add_argument(
+        "--precompute_cache_path", type=str, default=None,
+        help="Override location of the precomputed embed cache (.pt). When set, "
+             "the cache is read/written here instead of `<output_dir>/embed_cache.pt`. "
+             "Lets multiple training configs share one cache (e.g. main + smoke), "
+             "since the cache contents are keyed by data + resolution + num_frames "
+             "+ ignore_prompts, not by output_dir.",
+    )
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--width", type=int, default=832)
     p.add_argument("--dataset_repeat", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=1e-4)
+    p.add_argument(
+        "--gate_lr_multiplier", type=float, default=10.0,
+        help="LR multiplier for zero-init params (gates + tracks_head's final "
+             "layer). Default 10.0 (right for embodiment adapter where many "
+             "gates need to escape exactly-zero init). For the EgoWM-style "
+             "legacy variant (no gates), 1.0-3.0 is typically appropriate.",
+    )
     p.add_argument(
         "--lr_scheduler",
         type=str,
@@ -154,6 +387,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--num_epochs", type=int, default=1)
+    p.add_argument(
+        "--resume_render_ckpt",
+        type=str,
+        default=None,
+        help="Path to render_conditioner.pt from a finished run. Loads the "
+        "trainable subset into the DiT (strict=False) on CPU before FSDP. "
+        "Requires --epoch_offset > 0 so new epoch_* dirs do not overwrite "
+        "the previous run's checkpoints.",
+    )
+    p.add_argument(
+        "--epoch_offset",
+        type=int,
+        default=0,
+        help="Added to the inner epoch index for RNG seeds, logs, and "
+        "checkpoint folder names (epoch_{offset + inner}). Use 30 after "
+        "completing epoch_29 when continuing training.",
+    )
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
@@ -230,6 +480,23 @@ def parse_args() -> argparse.Namespace:
              "at init. See ARCHITECTURE_REVIEW.md §4.1.",
     )
     p.add_argument(
+        "--legacy_render_variant",
+        type=str,
+        default="egowm",
+        choices=("egowm", "v1", "v2"),
+        help="Selects which legacy (non-embodiment-adapter) render-conditioning "
+             "design to use:\n"
+             "  egowm (default): per-token spatial render encoder added "
+             "directly to per-token temb, no gate, no fuse Linear. Mirrors "
+             "EgoWM Eq. 5–6. No actions.\n"
+             "  v1 (BACKWARD-COMPAT): pooled-per-frame render encoder + Linear "
+             "fuse + scalar render_gate(=0.1). Use to load existing v1 ckpts.\n"
+             "  v2 (NEW, action-conditioned): ActionConditionedTembAdapter — "
+             "render Q ← cross_attn → actions K/V → LayerNorm → zero-init "
+             "Linear → ADD to temb_base. No gates; identity-at-init via "
+             "zero-init out_proj. Requires actions in the dataset/cache.",
+    )
+    p.add_argument(
         "--embodiment_kwargs",
         type=lambda s: json.loads(s) if isinstance(s, str) else s,
         default=None,
@@ -237,6 +504,15 @@ def parse_args() -> argparse.Namespace:
              "(e.g. {\"use_action_aware_adaln\": true, "
              "\"action_aware_kwargs\": {\"spatial_pool\": 2, \"action_dim\": null}}). "
              "Pass via --config JSON; CLI accepts a JSON string.",
+    )
+    p.add_argument(
+        "--v2_adapter_kwargs",
+        type=lambda s: json.loads(s) if isinstance(s, str) else s,
+        default=None,
+        help="JSON dict of kwargs forwarded to ActionConditionedTembAdapter "
+             "when --legacy_render_variant=v2 (e.g. "
+             "{\"action_dim\": 8, \"hidden_dim\": 512, \"num_heads\": 8, "
+             "\"spatial_downsample\": 2}). action_dim is required.",
     )
     p.add_argument(
         "--ignore_prompts",
@@ -255,6 +531,8 @@ def _load_dit_only(
     dtype: torch.dtype,
     use_embodiment_adapter: bool = False,
     embodiment_kwargs: Optional[Dict[str, Any]] = None,
+    legacy_render_variant: str = "egowm",
+    v2_adapter_kwargs: Optional[Dict[str, Any]] = None,
 ) -> WanTransformerRenderConditioned:
     """
     Load *only* the render-conditioned DiT (no VAE / text / image encoders).
@@ -268,6 +546,8 @@ def _load_dit_only(
         render_encoder_kwargs={},
         use_embodiment_adapter=use_embodiment_adapter,
         embodiment_kwargs=embodiment_kwargs,
+        legacy_render_variant=legacy_render_variant,
+        v2_adapter_kwargs=v2_adapter_kwargs,
     )
     if local_transformer:
         dit = WanTransformerRenderConditioned.from_pretrained(
@@ -284,15 +564,33 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
+    if getattr(args, "resume_render_ckpt", None):
+        rp = str(args.resume_render_ckpt).strip()
+        if not rp:
+            args.resume_render_ckpt = None
+        elif int(getattr(args, "epoch_offset", 0)) <= 0:
+            raise SystemExit(
+                "[FSDP train] --resume_render_ckpt requires --epoch_offset > 0 "
+                "(e.g. 30 after finishing epoch_29) so new epoch_* directories "
+                "do not overwrite checkpoints from the earlier run."
+            )
+
     # We manage DiT storage dtype manually via `_cast_module_for_fsdp`, and
     # never want Accelerate's FSDP path to upcast bf16 params to fp32 master
     # weights -- that doubles the sharded weight cost (e.g. ~8 -> ~16 GB/rank
     # for the 16B Wan DiT). FSDP still runs all-gather / reduce / compute in
     # the model's native (bf16) dtype, so we don't lose any speed.
+    # Default NCCL collective timeout is 30 min, which is shorter than the
+    # rank-0-only `_precompute_embeddings` walk (~5 sec/video × N samples → 70+ min
+    # for 881 videos). Bump to 4 h so ranks 1..N-1 wait patiently at the
+    # post-precompute `broadcast_object_list` instead of being killed by the
+    # NCCL watchdog. Subsequent runs hit the on-disk embed cache and never pay
+    # this wall-clock again.
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=None,
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=4))],
     )
     # Snapshot the BASE output dir before _setup_run_dir_and_logging mutates
     # it to `<base>/run_<timestamp>/`. The embed cache lives at the base so
@@ -347,6 +645,8 @@ def main() -> None:
         height=args.height,
         width=args.width,
         repeat=1,  # repeats are applied at the index level below
+        action_stats_path=args.action_stats_path,
+        action_field=args.action_field,
     )
     if accelerator.is_main_process:
         try:
@@ -359,57 +659,42 @@ def main() -> None:
     # otherwise default to bf16 to keep the precompute footprint bounded.
     encoder_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
 
-    # Run the precompute on RANK 0 ONLY, then broadcast the cache to the
-    # other ranks. We can't run it on every rank because under FSDP /
-    # ``fsdp_cpu_ram_efficient_loading=true`` the transformers
-    # ``from_pretrained(..., device_map="cuda:N")`` path silently drops the
-    # weights to CPU on non-main processes (rank 0 loads cuda:0 fine, but
-    # ranks 1+ get CPU weights -- hence the ``cpu vs cuda:N`` device
-    # mismatch in the embedding lookup). Loading on rank 0 only also halves
-    # CPU RAM peak and avoids 4 simultaneous reads of the 10+ GB encoder
-    # checkpoints.
+    # Sharded precompute: every rank encodes its slice on its own GPU, then
+    # results are all-gathered.  Cuts wall time ~world_size× vs. running on
+    # rank 0 only (the previous design was forced by an FSDP/from_pretrained
+    # interaction that we now sidestep via `safe_loading=True`).  The on-disk
+    # cache is still a single shared file keyed by the FULL dataset, so any
+    # relaunch with the same data instantly hits it.
+    from pathlib import Path as _Path
+    if getattr(args, "precompute_cache_path", None):
+        embed_cache_path = _Path(args.precompute_cache_path)
+    else:
+        embed_cache_path = _Path(args._embed_cache_base_dir) / "embed_cache.pt"
+    embed_cache_path.parent.mkdir(parents=True, exist_ok=True)
     if accelerator.is_main_process:
         accelerator.print(
-            f"[FSDP train] precomputing {len(dataset.rows)} samples on rank 0 "
-            f"(text + image + VAE + tracks, encoder_dtype={encoder_dtype}) ..."
+            f"[FSDP train] sharded precompute of {len(dataset.rows)} samples across "
+            f"{accelerator.num_processes} GPUs (encoder_dtype={encoder_dtype}) ..."
         )
-        # Disk cache lives at the BASE output dir (shared across run_<ts>
-        # subdirs) so every relaunch with the same dataset hits it. Key
-        # includes dataset contents + resolution + encoders, so editing the
-        # manifest or changing height/width invalidates automatically.
-        from pathlib import Path as _Path
-        embed_cache_path = _Path(args._embed_cache_base_dir) / "embed_cache.pt"
-        embed_cache, z_dim, scheduler = _precompute_embeddings(
-            args.model_path, dataset, accelerator.device,
-            args.height, args.width, args.num_frames, args.max_sequence_length,
-            encoder_dtype=encoder_dtype,
-            ignore_prompts=bool(args.ignore_prompts),
-            cache_path=embed_cache_path,
-        )
-        import gc as _gc
-        _gc.collect()
-        torch.cuda.empty_cache()
-    else:
-        embed_cache, z_dim, scheduler = None, None, None
-
-    # Broadcast precompute outputs from rank 0 to all other ranks. Cache
-    # tensors are CPU-side and the per-rank cache total is small (~tens of
-    # MB), so pickling + an NCCL broadcast of the byte buffer is cheap.
-    import torch.distributed as dist
-    if dist.is_available() and dist.is_initialized() and accelerator.num_processes > 1:
-        # ``broadcast_object_list`` pickles on rank 0 to a tensor on the
-        # caller-specified device, broadcasts via the active process group,
-        # and unpickles on every rank. With NCCL the staging tensor MUST be
-        # on the rank's GPU, so we pass ``accelerator.device``. The
-        # individual cache items are CPU tensors that survive the round-
-        # trip unchanged because pickle records their original device.
-        obj_list = [embed_cache, z_dim, scheduler]
-        dist.broadcast_object_list(obj_list, src=0, device=accelerator.device)
-        embed_cache, z_dim, scheduler = obj_list[0], obj_list[1], obj_list[2]
+    embed_cache, z_dim, scheduler = _precompute_embeddings_sharded(
+        accelerator=accelerator,
+        model_path=args.model_path,
+        dataset=dataset,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        max_seq_len=args.max_sequence_length,
+        encoder_dtype=encoder_dtype,
+        ignore_prompts=bool(args.ignore_prompts),
+        cache_path=embed_cache_path,
+    )
+    import gc as _gc
+    _gc.collect()
+    torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         accelerator.print(
-            f"[FSDP train] precompute done & broadcast: {len(embed_cache)} cached samples "
+            f"[FSDP train] precompute done: {len(embed_cache)} cached samples "
             f"(latents + prompt + image + condition + tracks)"
         )
 
@@ -420,6 +705,8 @@ def main() -> None:
         args.model_path, dtype,
         use_embodiment_adapter=bool(args.use_embodiment_adapter),
         embodiment_kwargs=args.embodiment_kwargs,
+        legacy_render_variant=getattr(args, "legacy_render_variant", "egowm"),
+        v2_adapter_kwargs=getattr(args, "v2_adapter_kwargs", None),
     )
     n_meta = _materialize_meta_submodules(dit)
     # ``_materialize_meta_submodules`` re-runs ``reset_parameters`` on every
@@ -458,15 +745,21 @@ def main() -> None:
             if args.use_embodiment_adapter:
                 for p_ in dit.embodiment.parameters():
                     p_.requires_grad = True
+            elif getattr(dit, "legacy_render_variant", "egowm") == "v2":
+                # v2: ActionConditionedTembAdapter is the entire trainable
+                # render-conditioner. No render_encoder / render_fuse /
+                # render_gate.
+                for p_ in dit.action_adapter.parameters():
+                    p_.requires_grad = True
             else:
+                # Legacy egowm / v1: render_encoder is always trainable.
+                # render_fuse and render_gate exist only in the "v1" variant.
                 for p_ in dit.render_encoder.parameters():
                     p_.requires_grad = True
-                for p_ in dit.render_fuse.parameters():
-                    p_.requires_grad = True
-                # render_gate is a top-level nn.Parameter on dit (not inside a
-                # submodule), so it isn't covered by render_encoder.parameters()
-                # or render_fuse.parameters(); enable it explicitly.
-                dit.render_gate.requires_grad = True
+                if getattr(dit, "legacy_render_variant", "egowm") == "v1":
+                    for p_ in dit.render_fuse.parameters():
+                        p_.requires_grad = True
+                    dit.render_gate.requires_grad = True
             if use_tracks_loss:
                 for p_ in dit.tracks_head.parameters():
                     p_.requires_grad = True
@@ -503,9 +796,19 @@ def main() -> None:
             for adapter in dit.embodiment.adapters.values():
                 adapter.gate.requires_grad = False
         else:
-            with torch.no_grad():
-                dit.render_gate.data.fill_(1.0)
-            dit.render_gate.requires_grad = False
+            # Legacy: only the v1 variant has a render_gate.
+            if getattr(dit, "legacy_render_variant", "egowm") == "v1":
+                with torch.no_grad():
+                    dit.render_gate.data.fill_(1.0)
+                dit.render_gate.requires_grad = False
+            elif accelerator.is_main_process:
+                accelerator.print(
+                    "[FSDP train] disable_render_gate=True is a NO-OP for the "
+                    "EgoWM-style legacy path (no gate exists)."
+                )
+
+    if getattr(args, "resume_render_ckpt", None):
+        _load_resume_render_ckpt(dit, str(args.resume_render_ckpt), accelerator)
 
     # All DiT params (frozen + trainable) are kept in the storage ``dtype``
     # (typically bf16). FSDP requires uniform dtype within each
@@ -529,9 +832,11 @@ def main() -> None:
                 for a in dit.embodiment.adapters.values()
                 for p in a.parameters()
             )
+            # render_adaln_gate / state_adaln_gate are per-channel (D,);
+            # report mean abs as a single scalar summary.
             gate_str = (
-                f"render_adaln_gate={float(dit.embodiment.render_adaln_gate.float().item()):.4g} "
-                f"state_adaln_gate={float(dit.embodiment.state_adaln_gate.float().item()):.4g}"
+                f"render_adaln_gate={float(dit.embodiment.render_adaln_gate.detach().float().abs().mean().item()):.4g} "
+                f"state_adaln_gate={float(dit.embodiment.state_adaln_gate.detach().float().abs().mean().item()):.4g}"
             )
             accelerator.print(
                 f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
@@ -542,15 +847,69 @@ def main() -> None:
                 f"disable_render_gate={args.disable_render_gate}  {gate_str}"
             )
         else:
-            accelerator.print(
-                f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
-                f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
-                f"tracks_head={n_th / 1e6:.2f}M  lambda_tracks={args.lambda_tracks}  "
-                f"use_tracks_loss={use_tracks_loss}  disable_render_gate={args.disable_render_gate}  "
-                f"render_gate={float(dit.render_gate.detach().float().item()):.4g}"
-            )
+            variant = getattr(dit, "legacy_render_variant", "egowm")
+            if variant == "v2":
+                n_aa = sum(p.numel() for p in dit.action_adapter.parameters())
+                accelerator.print(
+                    f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
+                    f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
+                    f"action_adapter={n_aa / 1e6:.2f}M (legacy variant='v2', no gates); "
+                    f"tracks_head={n_th / 1e6:.2f}M  "
+                    f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
+                )
+            else:
+                n_re = sum(p.numel() for p in dit.render_encoder.parameters())
+                extra = (
+                    f"render_gate={float(dit.render_gate.detach().float().item()):.4g}"
+                    if variant == "v1" else "no gate"
+                )
+                accelerator.print(
+                    f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
+                    f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
+                    f"render_encoder={n_re / 1e6:.2f}M (legacy variant={variant!r}); "
+                    f"tracks_head={n_th / 1e6:.2f}M  "
+                    f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}  "
+                    f"disable_render_gate={args.disable_render_gate}  {extra}"
+                )
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    # Zero-init params (gates + tracks_head's final layer) get a higher LR.
+    # AdamW step magnitude ≈ LR, so a param starting at exactly 0 needs many
+    # steps × LR to reach a useful magnitude. The right multiplier depends on
+    # the architecture:
+    #   - Embodiment adapter: many gates need to escape exactly-zero init →
+    #     10× usually right (default).
+    #   - EgoWM-style legacy: there are no gates, only tracks_head.mlp[-1] is
+    #     zero-init. tracks_head is a regular MLP (no SNR cancellation issue);
+    #     small/no boost is fine. Drop to 1-3× for this variant.
+    #   - v1 legacy: scalar render_gate has SNR cancellation, but with init=0.1
+    #     it's not exactly zero. Mild boost (3-5×) usually right.
+    # Override via the JSON config field ``gate_lr_multiplier``.
+    GATE_LR_MULT = float(getattr(args, "gate_lr_multiplier", 10.0))
+    def _is_zero_init_param(n: str) -> bool:
+        return (
+            n.endswith(".gate")
+            or n.endswith("_gate")
+            or "tracks_head.mlp.4" in n
+        )
+    _gate_param_ids = {
+        id(p) for n, p in dit.named_parameters()
+        if p.requires_grad and _is_zero_init_param(n)
+    }
+    gate_params  = [p for p in trainable_params if id(p) in _gate_param_ids]
+    other_params = [p for p in trainable_params if id(p) not in _gate_param_ids]
+    if accelerator.is_main_process:
+        accelerator.print(
+            f"[FSDP train] LR groups: zero_init_params={len(gate_params)} "
+            f"(lr={args.learning_rate * GATE_LR_MULT:.1e}, {GATE_LR_MULT:g}× boost), "
+            f"other_params={len(other_params)} (lr={args.learning_rate:.1e})"
+        )
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": gate_params,  "lr": args.learning_rate * GATE_LR_MULT},
+            {"params": other_params, "lr": args.learning_rate},
+        ],
+        weight_decay=args.weight_decay,
+    )
 
     n_samples = len(embed_cache)
     world_size = int(accelerator.num_processes)
@@ -649,12 +1008,19 @@ def main() -> None:
     #   3. Per-epoch mean    (`train/loss_flow_epoch_mean`)       — best long-run trend signal
     flow_ema: Optional[float] = None
     flow_ema_decay = 0.95
+    # Last grad norm we computed on a sync (non-accumulation) step. Within
+    # a step, `grad_norm` is initialized to NaN and only overwritten when
+    # `accelerator.sync_gradients` fires (every `gradient_accumulation_steps`
+    # micro-steps). So if we display `grad_norm` directly, half the values
+    # are the sentinel NaN. Keep the most recent real one for display.
+    last_valid_grad_norm: float = float("nan")
     n_t = len(scheduler.timesteps)
     bucket_edges = [n_t * k // 4 for k in range(5)]   # [0, n/4, n/2, 3n/4, n]
     bucket_sum = [0.0, 0.0, 0.0, 0.0]
     bucket_cnt = [0, 0, 0, 0]
 
     for epoch in range(args.num_epochs):
+        abs_e = int(args.epoch_offset) + int(epoch)
         # Reset per-epoch flow loss accumulator. Within an epoch each rank
         # processes a fixed disjoint slice of samples, so averaging over
         # the full epoch absorbs sample-, timestep- and noise-variance and
@@ -666,7 +1032,7 @@ def main() -> None:
         # disjoint subset of samples per "step bucket". This replaces the
         # previous DataLoader+DistributedSampler path.
         g = torch.Generator()
-        g.manual_seed(args.seed + epoch)
+        g.manual_seed(args.seed + abs_e)
         full_indices = torch.randperm(n_samples, generator=g).tolist()
         if args.dataset_repeat > 1:
             full_indices = full_indices * args.dataset_repeat
@@ -676,7 +1042,7 @@ def main() -> None:
             full_indices = full_indices + full_indices[:pad]
         my_indices = full_indices[rank::world_size]
 
-        bar = tqdm(my_indices, disable=not accelerator.is_main_process, desc=f"epoch {epoch}")
+        bar = tqdm(my_indices, disable=not accelerator.is_main_process, desc=f"epoch {abs_e}")
         for step, sample_idx in enumerate(bar):
             with accelerator.accumulate(dit):
                 cached = embed_cache[sample_idx]
@@ -685,6 +1051,15 @@ def main() -> None:
                 prompt_embeds = cached["prompt_embeds"].to(device=device, dtype=dtype, non_blocking=True)
                 image_embeds = cached["image_embeds"].to(device=device, dtype=dtype, non_blocking=True)
                 condition = cached["condition"].to(device=device, dtype=dtype, non_blocking=True)
+                # Optional 8-d (or 7-d) per-frame action stream — fed into the
+                # action-aware adapter when the embodiment module's
+                # ``use_action_aware_adaln`` is on. Cached as a (T, D) tensor
+                # by precompute; we add the batch dim here.
+                actions: Optional[torch.Tensor] = None
+                if "actions" in cached:
+                    actions = cached["actions"].to(
+                        device=device, dtype=dtype, non_blocking=True,
+                    ).unsqueeze(0)                                   # (1, T, D)
 
                 # Tracks supervision (optional).
                 gt_xy: Optional[torch.Tensor] = None
@@ -730,7 +1105,7 @@ def main() -> None:
                     and not args.drop_render_conditioning
                 ):
                     drop_g = torch.Generator()
-                    drop_g.manual_seed(int(args.seed) * 1_000_003 + epoch * 65521 + global_step)
+                    drop_g.manual_seed(int(args.seed) * 1_000_003 + abs_e * 65521 + global_step)
                     drop_render_step = bool(
                         torch.rand((1,), generator=drop_g).item() < args.render_dropout_prob
                     )
@@ -747,6 +1122,13 @@ def main() -> None:
                     ),
                     return_dict=False,
                 )
+                # Mirror render-dropout on actions: when the render is dropped
+                # this step (CFG branch), drop actions too so the
+                # unconditional branch is truly action-free.
+                if actions is not None and not (
+                    args.drop_render_conditioning or drop_render_step
+                ):
+                    forward_kwargs["actions"] = actions
                 if query_xy is not None and not drop_render_step:
                     # When the render is dropped this step, the tracks-head
                     # path is also disabled (it requires the conditioned
@@ -841,11 +1223,14 @@ def main() -> None:
                         inner = accelerator.unwrap_model(dit)
                         if args.use_embodiment_adapter:
                             groups = [("embodiment", inner.embodiment)]
+                        elif getattr(inner, "legacy_render_variant", "egowm") == "v2":
+                            # v2: only the action_adapter; no render_encoder.
+                            groups = [("action_adapter", inner.action_adapter)]
                         else:
-                            groups = [
-                                ("render_encoder", inner.render_encoder),
-                                ("render_fuse",    inner.render_fuse),
-                            ]
+                            # egowm: render_encoder only. v1 also adds render_fuse.
+                            groups = [("render_encoder", inner.render_encoder)]
+                            if getattr(inner, "legacy_render_variant", "egowm") == "v1":
+                                groups.append(("render_fuse", inner.render_fuse))
                         if use_tracks_loss:
                             groups.append(("tracks_head", inner.tracks_head))
                         msg_parts = []
@@ -883,6 +1268,8 @@ def main() -> None:
                             )
                         if gn is not None:
                             grad_norm = gn.detach().to(device)
+                            if torch.isfinite(grad_norm).item():
+                                last_valid_grad_norm = float(grad_norm)
                     # Rank-consistent grad-finite decision. Under FSDP,
                     # ``dit.clip_grad_norm_`` already returns a globally-reduced
                     # value so the per-rank isfinite check would agree -- but
@@ -948,10 +1335,23 @@ def main() -> None:
                 # converted to Scalar". summon_full_params is a collective so
                 # every rank enters; rank0_only gathers only onto rank 0.
                 inner_dit = accelerator.unwrap_model(dit)
-                with FSDP.summon_full_params(dit, writeback=False, recurse=True, rank0_only=True):
+                # ``offload_to_cpu=True``: materialize the unsharded params on
+                # CPU instead of GPU rank 0. We only read tiny scalar/per-channel
+                # gate values from this — the GPU-side cost (~28 GB for Wan
+                # 14B unsharded) was OOM'ing 44 GB cards (L40 / A6000).
+                with FSDP.summon_full_params(
+                    dit, writeback=False, recurse=True, rank0_only=True,
+                    offload_to_cpu=True,
+                ):
                     if accelerator.is_main_process:
                         elapsed = time.time() - t0
-                        gn_disp = float(grad_norm) if torch.isfinite(grad_norm).item() else float("nan")
+                        # Prefer the last sync-step grad norm; on accumulation
+                        # steps `grad_norm` is the per-step NaN sentinel.
+                        gn_disp = (
+                            float(grad_norm)
+                            if torch.isfinite(grad_norm).item()
+                            else last_valid_grad_norm
+                        )
                         sigma_frac = float(t_idx) / max(1, n_t - 1)
                         if args.use_embodiment_adapter:
                             if getattr(inner_dit.embodiment, "use_action_aware_adaln", False):
@@ -961,9 +1361,17 @@ def main() -> None:
                                     .float().abs().mean().item()
                                 )
                             else:
-                                gate_disp = float(inner_dit.embodiment.render_adaln_gate.float().item())
+                                # per-channel (D,); mean abs as scalar summary
+                                gate_disp = float(
+                                    inner_dit.embodiment.render_adaln_gate.detach()
+                                    .float().abs().mean().item()
+                                )
                         else:
-                            gate_disp = float(inner_dit.render_gate.float().item())
+                            # Legacy: only the v1 variant has a render_gate.
+                            if getattr(inner_dit, "legacy_render_variant", "egowm") == "v1":
+                                gate_disp = float(inner_dit.render_gate.float().item())
+                            else:
+                                gate_disp = float("nan")    # no gate exists
                         bar.set_postfix(
                             loss=f"{float(loss_g):.3f}",
                             flow=f"{float(flow_g):.3f}",
@@ -988,20 +1396,26 @@ def main() -> None:
                                 "train/lr": optimizer.param_groups[0]["lr"],
                                 "train/timestep": float(timestep_scalar.item()),
                                 "train/timestep_sigma_frac": sigma_frac,
-                                "train/epoch": epoch,
+                                "train/epoch": abs_e,
                                 "train/elapsed_s": elapsed,
                                 "train/drop_render_step": float(drop_render_step),
                             }
                             if args.use_embodiment_adapter:
+                                # per-channel (D,) gates → log mean abs
                                 log_payload["train/render_adaln_gate"] = float(
-                                    inner_dit.embodiment.render_adaln_gate.float().item()
+                                    inner_dit.embodiment.render_adaln_gate.detach()
+                                    .float().abs().mean().item()
                                 )
                                 log_payload["train/state_adaln_gate"] = float(
-                                    inner_dit.embodiment.state_adaln_gate.float().item()
+                                    inner_dit.embodiment.state_adaln_gate.detach()
+                                    .float().abs().mean().item()
                                 )
                                 for adapter_id, adapter in inner_dit.embodiment.adapters.items():
+                                    # gate is now per-channel (D,); log mean abs
+                                    # as the scalar summary. Same metric shape
+                                    # as render_adaln_gate / state_adaln_gate.
                                     log_payload[f"train/adapter_{adapter_id}_gate"] = float(
-                                        adapter.gate.float().item()
+                                        adapter.gate.detach().float().abs().mean().item()
                                     )
                                 # Action-aware AdaLN: gate is per-channel (D,), so log
                                 # aggregate stats. Bootstrap check: ``gate_norm`` should
@@ -1016,9 +1430,20 @@ def main() -> None:
                                     log_payload["train/action_aware_gate_norm"] = float(aa_gate.norm().item())
                                     log_payload["train/action_aware_gate_max_abs"] = float(aa_gate.abs().max().item())
                             else:
-                                log_payload["train/render_gate"] = float(
-                                    inner_dit.render_gate.float().item()
-                                )
+                                lrv_log = getattr(inner_dit, "legacy_render_variant", "egowm")
+                                if lrv_log == "v1":
+                                    log_payload["train/render_gate"] = float(
+                                        inner_dit.render_gate.float().item()
+                                    )
+                                elif lrv_log == "v2":
+                                    # v2 has no gates — diagnose via the
+                                    # zero-init out_proj weight. Its norm
+                                    # ramps from 0 as gradient flows. Stays-at-0
+                                    # would indicate the meta-materialization
+                                    # bug re-zeroed cross_attn.in_proj_weight.
+                                    op = inner_dit.action_adapter.out_proj.weight.detach().float()
+                                    log_payload["train/action_adapter_out_proj_norm"] = float(op.norm().item())
+                                    log_payload["train/action_adapter_out_proj_max_abs"] = float(op.abs().max().item())
                             # Per-quartile (by timestep) running-average flow loss.
                             # The "mid" buckets (Q1, Q2) are the hardest and are
                             # the best signal of actual learning progress.
@@ -1040,14 +1465,14 @@ def main() -> None:
                 else ""
             )
             accelerator.print(
-                f"[epoch {epoch}] mean flow_loss = {epoch_mean:.4f} "
+                f"[epoch {abs_e}] mean flow_loss = {epoch_mean:.4f} "
                 f"over {epoch_flow_cnt} steps  |  ema = {flow_ema:.4f}{hint}"
             )
             if use_wandb:
                 import wandb
                 wandb.log({
                     "train/loss_flow_epoch_mean": epoch_mean,
-                    "train/epoch_done": epoch,
+                    "train/epoch_done": abs_e,
                 }, step=global_step)
 
         should_save = (
@@ -1057,7 +1482,12 @@ def main() -> None:
         if should_save:
             # FSDP.summon_full_params is a collective call: all ranks must enter.
             # rank0_only=True ensures only rank 0 actually populates the gathered weights.
-            with FSDP.summon_full_params(dit, writeback=False, recurse=True, rank0_only=True):
+            # offload_to_cpu=True keeps the full unsharded params on CPU, not GPU —
+            # crucial for 44 GB cards (L40, A6000) where summoning on GPU OOMs.
+            with FSDP.summon_full_params(
+                dit, writeback=False, recurse=True, rank0_only=True,
+                offload_to_cpu=True,
+            ):
                 if (
                     accelerator.is_main_process
                     and int(args.condition_usage_sanity_samples) > 0
@@ -1070,7 +1500,7 @@ def main() -> None:
                         device,
                         dtype,
                         int(args.condition_usage_sanity_samples),
-                        int(args.seed) + int(epoch),
+                        int(args.seed) + int(abs_e),
                     )
                     if stats is not None:
                         accelerator.print(
@@ -1090,7 +1520,7 @@ def main() -> None:
                             }, step=global_step)
 
             accelerator.wait_for_everyone()
-            save_dir = os.path.join(args.output_dir, f"epoch_{epoch}")
+            save_dir = os.path.join(args.output_dir, f"epoch_{abs_e}")
             if accelerator.is_main_process:
                 os.makedirs(save_dir, exist_ok=True)
 
@@ -1104,6 +1534,12 @@ def main() -> None:
                     if args.use_embodiment_adapter:
                         keep_prefixes = ["embodiment."]
                         keep_exact: set = set()
+                    elif getattr(args, "legacy_render_variant", "egowm") == "v2":
+                        # v2: ActionConditionedTembAdapter lives at
+                        # `action_adapter.*`. No render_encoder / render_fuse /
+                        # render_gate in this path.
+                        keep_prefixes = ["action_adapter."]
+                        keep_exact = set()
                     else:
                         keep_prefixes = ["render_encoder.", "render_fuse."]
                         # render_gate is a top-level Parameter (no submodule

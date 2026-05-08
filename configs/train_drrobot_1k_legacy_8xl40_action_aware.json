@@ -1,0 +1,68 @@
+{
+  "_comment_target": "Action-aware embodiment adapter (use_embodiment_adapter=true + use_action_aware_adaln=true) on the full 802-clip droid_1k train split, FSDP. Layered conditioning: (i) RenderSpatialEncoder (Q) ← cross_attn → action_proj(8-d joint+gripper)(K,V) → DecoupledAdaLNHead → per-channel-gated AdaLN delta; (ii) state-encoder + render-encoder → render_to_adaln + state_to_adaln deltas; (iii) RenderCrossAttnAdapter at blocks 7,15,23,31,39. NOT identity-at-init only because gate_lr_multiplier=10× ramps the zero-init gates fast — model output IS bit-exact vanilla Wan at step 0 (every gate=0).",
+
+  "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+  "dataset_base_path": "data_wan_1k",
+  "metadata_csv": "data_wan_1k/train_metadata_train.csv",
+  "output_dir": "./checkpoints/wan_render_drrobot_1k_legacy_8xl40_action_aware",
+
+  "num_frames": 17,
+  "height": 240,
+  "width": 432,
+
+  "_action_note": "8-d state (joint_position 7 + gripper 1) z-scored against train-split stats. Aligned 1:1 with camera frames via shared np.linspace indices.",
+  "action_stats_path": "data_wan_1k/action_stats.json",
+  "action_field": "state",
+
+  "_cache_note": "Different cache file from the egowm (no-actions) 17f cache because the actions key changes precompute output. _PRECOMPUTE_CACHE_VERSION=2.",
+  "precompute_cache_path": "data_wan_1k/precompute_cache_17f_v2.pt",
+
+  "dataset_repeat": 1,
+  "num_epochs": 30,
+  "save_every_n_epochs": 5,
+
+  "learning_rate": 2e-05,
+  "gate_lr_multiplier": 10.0,
+  "lr_scheduler": "cosine_warmup",
+  "lr_warmup_steps": 200,
+  "lr_min_ratio": 0.0,
+  "weight_decay": 0.001,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+
+  "trainable": "render_only",
+  "unfreeze_last_n_blocks": 8,
+  "disable_render_gate": false,
+
+  "max_sequence_length": 256,
+  "mixed_precision": "bf16",
+  "num_workers": 4,
+  "log_every_n_steps": 1,
+
+  "condition_usage_sanity_samples": 0,
+  "render_dropout_prob": 0.1,
+
+  "lambda_tracks": 0.1,
+  "ref_frame": 1,
+  "max_query_points": 128,
+
+  "ignore_prompts": true,
+
+  "use_embodiment_adapter": true,
+  "embodiment_kwargs": {
+    "use_action_aware_adaln": true,
+    "action_aware_kwargs": {
+      "spatial_pool": 2,
+      "action_dim": 8,
+      "num_heads": 8,
+      "adaln_rank": 512,
+      "hidden_dim": 512
+    }
+  },
+  "legacy_render_variant": "egowm",
+
+  "wandb_project": "wan_flow_drrobot",
+  "wandb_run_name": "1k_legacy_8xl40_action_aware_v1",
+  "wandb_mode": "online"
+}

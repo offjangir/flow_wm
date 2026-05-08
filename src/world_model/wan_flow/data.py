@@ -16,6 +16,7 @@ Paths are resolved relative to ``base_path`` unless absolute.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +47,70 @@ def _load_video_frames(path: str, num_frames: int) -> List[Image.Image]:
         )
     idxs = np.linspace(0, len(all_frames) - 1, num_frames).astype(int)
     return [all_frames[i] for i in idxs]
+
+
+def _load_actions_npz(
+    path: str,
+    num_frames: int,
+    stats: Optional[Dict[str, np.ndarray]] = None,
+    field: str = "state",
+) -> np.ndarray:
+    """Load (T_raw, D) action stream and subsample to ``num_frames`` indices
+    that match the camera-frame loader.
+
+    DROID convention: the camera mp4 has ``T_raw - 1`` frames (one trailing
+    "post-final" action step is recorded after the last camera capture).
+    Truncating to the first ``T_raw - 1`` action steps yields a 1:1 index
+    correspondence with camera frames; ``np.linspace`` with the same rule as
+    :func:`_load_video_frames` then picks the same indices.
+
+    Args:
+        path:       absolute path to ``.npz`` written by ``scripts/extract_actions.py``.
+        num_frames: temporal length to return (matches the video loader).
+        stats:      optional ``{"mean": (D,), "std": (D,)}`` for z-score
+                    normalization. Pass ``None`` for raw values.
+        field:      which array in the npz to read (``state`` for 8-d
+                    joint+gripper; ``action`` for 7-d cmd target+gripper).
+
+    Returns:
+        ``(num_frames, D) float32`` numpy array.
+    """
+    blob = np.load(path)
+    if field not in blob.files:
+        raise KeyError(
+            f"{path}: missing field {field!r}; available={list(blob.files)}"
+        )
+    arr = np.asarray(blob[field], dtype=np.float32)            # (T_raw, D)
+    if arr.ndim != 2:
+        raise ValueError(f"{path}: expected 2D, got shape {arr.shape}")
+    T_raw = arr.shape[0]
+    if T_raw < 2:
+        raise ValueError(f"{path}: too few timesteps ({T_raw})")
+    # Drop trailing post-final step → align with camera-frame indexing.
+    n_video_frames = T_raw - 1
+    if n_video_frames < num_frames:
+        raise ValueError(
+            f"{path}: only {n_video_frames} usable action steps but "
+            f"num_frames={num_frames} requested."
+        )
+    idxs = np.linspace(0, n_video_frames - 1, num_frames).astype(int)
+    sub = arr[idxs]                                            # (num_frames, D)
+    if stats is not None:
+        mean = np.asarray(stats["mean"], dtype=np.float32)
+        std = np.asarray(stats["std"], dtype=np.float32)
+        sub = (sub - mean) / std
+    return sub.astype(np.float32, copy=False)
+
+
+def _load_action_stats(path: Optional[str]) -> Optional[Dict[str, np.ndarray]]:
+    if not path:
+        return None
+    with open(path, "r") as f:
+        blob = json.load(f)
+    return {
+        "mean": np.asarray(blob["mean"], dtype=np.float32),
+        "std": np.asarray(blob["std"], dtype=np.float32),
+    }
 
 
 def _load_tracks_npz(
@@ -127,6 +192,8 @@ class RenderI2VMetadataDataset(Dataset):
         height: int,
         width: int,
         repeat: int = 1,
+        action_stats_path: Optional[str] = None,
+        action_field: str = "state",
     ):
         self.base_path = os.path.abspath(base_path)
         self.num_frames = num_frames
@@ -141,6 +208,25 @@ class RenderI2VMetadataDataset(Dataset):
         # here so training encodes the empty prompt, not the literal string "nan".
         df["prompt"] = df["prompt"].fillna("").astype(str)
         self.has_tracks = "tracks" in df.columns
+        # Actions present iff the column exists AND every row has a non-empty
+        # path. Mixed batches (some rows with, some without) would force the
+        # model into "actions=None" branch on those samples and silently train
+        # an action-aware adapter without supervision; treat as all-or-nothing.
+        if "actions" in df.columns:
+            df["actions"] = df["actions"].fillna("").astype(str)
+            n_have = (df["actions"].str.len() > 0).sum()
+            self.has_actions = bool(n_have == len(df))
+            if 0 < n_have < len(df):
+                raise ValueError(
+                    f"metadata CSV {metadata_csv}: 'actions' present in "
+                    f"{n_have}/{len(df)} rows. Either populate every row or "
+                    f"drop the rows with empty 'actions'."
+                )
+        else:
+            self.has_actions = False
+        self.action_stats = _load_action_stats(action_stats_path)
+        self._action_stats_path = action_stats_path or ""
+        self.action_field = action_field
         self.rows = df.to_dict("records")
         self.repeat = repeat
 
@@ -148,7 +234,7 @@ class RenderI2VMetadataDataset(Dataset):
         return p if os.path.isabs(p) else os.path.join(self.base_path, p)
 
     def assert_local_files_exist(self) -> None:
-        """Fail fast if CSV points to missing videos / renders / tracks."""
+        """Fail fast if CSV points to missing videos / renders / tracks / actions."""
         missing: List[str] = []
         for i, row in enumerate(self.rows):
             for key in ("video", "render"):
@@ -161,6 +247,12 @@ class RenderI2VMetadataDataset(Dataset):
                     pt = self._abs(t)
                     if not os.path.isfile(pt):
                         missing.append(f"  row {i + 1} column 'tracks': {pt}")
+            if self.has_actions:
+                a = row.get("actions", "") or ""
+                if a:
+                    pa = self._abs(a)
+                    if not os.path.isfile(pa):
+                        missing.append(f"  row {i + 1} column 'actions': {pa}")
         if not missing:
             return
         head = "\n".join(missing[:25])
@@ -200,6 +292,16 @@ class RenderI2VMetadataDataset(Dataset):
                 sample["trajs"] = trajs           # (num_frames, N, 2) in [-1, 1]
                 sample["visibs"] = visibs         # (num_frames, N) in {0, 1}
                 sample["track_image_size"] = (H_t, W_t)
+
+        if self.has_actions:
+            a = row.get("actions", "") or ""
+            if a:
+                sample["actions"] = _load_actions_npz(
+                    self._abs(a),
+                    self.num_frames,
+                    stats=self.action_stats,
+                    field=self.action_field,
+                )                                  # (num_frames, D) float32
 
         return sample
 

@@ -299,11 +299,13 @@ class RenderCrossAttnAdapter(nn.Module):
     block's normal forward, this adapter lets the DiT pull *spatially-
     indexed* action information that AdaLN modulation cannot express.
 
-    Identity-at-init: ``out_proj`` zero-initialized **and** a scalar
-    ``gate`` initialized to 0.  Either alone would suffice; both gives
-    healthier early-training gradients (zero out_proj gives a cleaner
-    bootstrap, scalar gate gives a smoother off-ramp once ``out_proj`` has
-    been perturbed).
+    Identity-at-init: scalar ``gate`` initialized to 0 (alone). DO NOT
+    additionally zero ``out_proj.weight`` — that creates a dual-zero
+    bootstrap deadlock: ∂L/∂gate ∝ out_proj(attn(...)) and
+    ∂L/∂out_proj.weight ∝ gate, so if both are zero, no gradient ever
+    flows and the adapter stays at identity forever.  Keep
+    MultiheadAttention's default kaiming-init on out_proj; gate=0 alone
+    suffices for identity-at-init and gives a healthy gradient escape.
 
     Memory: a Wan I2V latent has num_tokens ≈ 21 · 30 · 52 ≈ 33 K and the
     KV bank is ~5 K, so cross-attention is O(33K · 5K · D / heads) ≈ a
@@ -330,9 +332,13 @@ class RenderCrossAttnAdapter(nn.Module):
             vdim=kv_dim,
             batch_first=True,
         )
-        # Zero out the output projection so the adapter is identity at init.
-        _zero_init_(self.attn.out_proj)
-        self.gate = nn.Parameter(torch.zeros(1))
+        # Per-channel gate (D,). Zero-init → identity at step 0; each channel
+        # ramps independently. A scalar gate (size-1) has terrible SNR because
+        # its single gradient averages over (B, num_tokens, D)≈10M terms with
+        # mixed signs that cancel — empirically scalar gates stay at exactly 0
+        # while per-channel gates ramp to ~0.03 norm in the same training time.
+        # Don't also zero out_proj — see class docstring on dual-zero deadlock.
+        self.gate = nn.Parameter(torch.zeros(dim))
 
     def forward(self, h_tokens: torch.Tensor, kv_bank: torch.Tensor) -> torch.Tensor:
         """

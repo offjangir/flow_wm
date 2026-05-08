@@ -163,6 +163,15 @@ def _process_scene_dense(
 
     sx, sy = vidW / float(atW), vidH / float(atH)
 
+    # AllTracker may have run on a uniformly-subsampled subset of the source
+    # frames (np.linspace(0, T_source-1, T)). To draw tracks on the right
+    # source frames we have to apply the same subsampling here.
+    T_tracks = flow.shape[0]
+    T_source = int(z["T_source"]) if "T_source" in z.files else len(frames)
+    if len(frames) >= T_source > T_tracks:
+        idxs = np.linspace(0, T_source - 1, T_tracks, dtype=np.int64)
+        frames = [frames[int(i)] for i in idxs]
+
     T = min(len(frames), flow.shape[0])
     frames = frames[:T]
     flow = flow[:T]
@@ -247,6 +256,16 @@ def _process_scene(
     trajs[..., 1] *= sy
     queries_xy0[:, 0] *= sx
     queries_xy0[:, 1] *= sy
+
+    # AllTracker may have run on a uniformly-subsampled subset of the source
+    # frames (np.linspace(0, T_source-1, T)). To draw tracks on the right
+    # source frames we apply the same subsampling here. Without this the
+    # trails look "wrong" — points are drawn on much earlier robot poses.
+    T_tracks = trajs.shape[0]
+    T_source = int(z["T_source"]) if "T_source" in z.files else len(frames)
+    if len(frames) >= T_source > T_tracks:
+        idxs = np.linspace(0, T_source - 1, T_tracks, dtype=np.int64)
+        frames = [frames[int(i)] for i in idxs]
 
     T = min(len(frames), trajs.shape[0])
     frames = frames[:T]

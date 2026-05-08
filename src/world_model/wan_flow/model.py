@@ -42,7 +42,13 @@ from diffusers.utils.peft_utils import scale_lora_layers, unscale_lora_layers
 from diffusers.utils import logging as diffusers_logging
 from transformers import CLIPVisionModel
 
-from world_model.wan_flow.embodiment_adapter import EmbodimentAgnosticConditioning
+from world_model.wan_flow.embodiment_adapter import (
+    EmbodimentAgnosticConditioning,
+    RenderSpatialEncoder,
+)
+from world_model.wan_flow.embodiment_adapter_v2 import (
+    ActionConditionedTembAdapter,
+)
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -287,6 +293,7 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
         "render_encoder",
         "render_fuse",
         "embodiment",
+        "action_adapter",
         "tracks_head",
         "scale_shift_table",
         "norm_out",
@@ -315,6 +322,27 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
         tracks_head_kwargs: Optional[Dict[str, Any]] = None,
         use_embodiment_adapter: bool = False,
         embodiment_kwargs: Optional[Dict[str, Any]] = None,
+        # Selects which legacy variant to instantiate when
+        # ``use_embodiment_adapter=False``:
+        #   * "egowm"  (default): per-token spatial render encoder, no gate,
+        #              no fuse — direct additive to temb. Mirrors EgoWM Eq. 5.
+        #              No actions.
+        #   * "v1"     (BACKWARD-COMPAT): pooled-per-frame render encoder +
+        #              render_fuse Linear + scalar render_gate(=0.1) → adds
+        #              to temb. Original variant; kept as an ablation baseline.
+        #   * "v2"     (NEW, action-conditioned): ``ActionConditionedTembAdapter``
+        #              from ``embodiment_adapter_v2``. Per-token render features
+        #              cross-attend over the action trajectory; LayerNorm +
+        #              zero-init Linear projects to inner_dim and the result is
+        #              ADDED to temb_base BEFORE time_proj. Identity-at-init via
+        #              zero-init out_proj (no gates). Requires ``actions`` in
+        #              forward().
+        legacy_render_variant: str = "egowm",
+        # Kwargs forwarded to ``ActionConditionedTembAdapter`` when
+        # ``legacy_render_variant="v2"`` (e.g. {"action_dim": 8, "hidden_dim":
+        # 512, "num_heads": 8, "spatial_downsample": 2}). ``action_dim`` must
+        # match the action-stream feature dim (8 for joint+gripper).
+        v2_adapter_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             patch_size,
@@ -353,21 +381,61 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
             self.embodiment = EmbodimentAgnosticConditioning(**emb_kw)
             self.embodiment.to(torch.float32)
         else:
+            # Legacy path comes in three variants — see ``legacy_render_variant``
+            # docstring on __init__ above.
+            if legacy_render_variant not in ("egowm", "v1", "v2"):
+                raise ValueError(
+                    f"legacy_render_variant must be 'egowm', 'v1', or 'v2'; "
+                    f"got {legacy_render_variant!r}"
+                )
+            self.legacy_render_variant = legacy_render_variant
             re_kw = dict(render_encoder_kwargs or {})
-            self.render_encoder = RenderLatentEncoder(
-                in_channels=render_latent_channels, out_dim=inner_dim, **re_kw
-            )
-            # Fusion projection: render_encoder output -> additive perturbation to
-            # the timestep embedding (EgoWM Eq. 5). Healthy non-zero init keeps
-            # gradient flowing back into render_encoder; the scalar render_gate
-            # (initialized to zero) makes the actual contribution exactly zero
-            # at step 0 while not killing the gradient bootstrap. This is the
-            # same trick used by ControlNet (zero-conv) / IP-Adapter / FLUX-Redux.
-            self.render_fuse = nn.Linear(inner_dim, inner_dim)
-            nn.init.zeros_(self.render_fuse.bias)
-            self.render_gate = nn.Parameter(torch.zeros(1))
-            self.render_encoder.to(torch.float32)
-            self.render_fuse.to(torch.float32)
+            if legacy_render_variant == "egowm":
+                # Per-token spatial encoder + direct additive (no gate, no
+                # fuse). Mirrors EgoWM (Bagchi et al. 2026, Eq. 5–6).
+                # spatial_pool=2 makes the encoder grid (H_lat/2, W_lat/2)
+                # match Wan's post-patch grid, so output (B, T_lat·h·w, D)
+                # lines up token-for-token with the DiT.
+                re_kw.setdefault("hidden_dim", 512)
+                re_kw.setdefault("spatial_pool", 2)
+                self.render_encoder = RenderSpatialEncoder(
+                    in_channels=render_latent_channels,
+                    out_dim=inner_dim,
+                    **re_kw,
+                )
+                self.render_encoder.to(torch.float32)
+            elif legacy_render_variant == "v2":
+                # NEW: action-conditioned temb adapter. Per-token render
+                # features cross-attend over actions, LayerNorm + zero-init
+                # Linear → contribution → ADD to temb_base → time_proj.
+                # No gates anywhere; identity-at-init via zero-init out_proj.
+                v2_kw = dict(v2_adapter_kwargs or {})
+                if "action_dim" not in v2_kw:
+                    raise ValueError(
+                        "legacy_render_variant='v2' requires "
+                        "v2_adapter_kwargs.action_dim (e.g. 8 for "
+                        "joint_position+gripper)."
+                    )
+                v2_kw.setdefault("inner_dim", inner_dim)
+                v2_kw.setdefault("render_in_channels", render_latent_channels)
+                v2_kw.setdefault("hidden_dim", 512)
+                v2_kw.setdefault("num_heads", 8)
+                v2_kw.setdefault("spatial_downsample", 2)
+                self.action_adapter = ActionConditionedTembAdapter(**v2_kw)
+                self.action_adapter.to(torch.float32)
+            else:
+                # v1: original pooled-per-frame encoder + Linear fuse +
+                # scalar render_gate. Backward-compat with checkpoints
+                # trained before the EgoWM-style refactor.
+                self.render_encoder = RenderLatentEncoder(
+                    in_channels=render_latent_channels, out_dim=inner_dim, **re_kw
+                )
+                self.render_fuse = nn.Linear(inner_dim, inner_dim)
+                nn.init.zeros_(self.render_fuse.bias)
+                # Scalar gate init=0.1 — see SNR notes in earlier comments.
+                self.render_gate = nn.Parameter(torch.full((1,), 0.1))
+                self.render_encoder.to(torch.float32)
+                self.render_fuse.to(torch.float32)
 
         th_kw = dict(tracks_head_kwargs or {})
         self.tracks_head = TracksHead(in_dim=inner_dim, **th_kw)
@@ -387,19 +455,58 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
         """
         with torch.no_grad():
             if self.use_embodiment_adapter:
-                self.embodiment.render_to_adaln.up.weight.zero_()
-                if self.embodiment.render_to_adaln.up.bias is not None:
-                    self.embodiment.render_to_adaln.up.bias.zero_()
-                self.embodiment.state_to_adaln.up.weight.zero_()
-                if self.embodiment.state_to_adaln.up.bias is not None:
-                    self.embodiment.state_to_adaln.up.bias.zero_()
+                # Mirror EmbodimentAgnosticConditioning.__init__: kaiming-init
+                # `up.weight` (NOT zero) so gradient can flow into both `up`
+                # and the per-channel gate. Zeroing both creates the dual-zero
+                # bootstrap deadlock that the constructor explicitly defends
+                # against — and which `reset_parameters` (called by
+                # `_materialize_meta_submodules`) would also undo. Identity-
+                # at-init is preserved because the gate is zero.
+                for _head in (self.embodiment.render_to_adaln,
+                              self.embodiment.state_to_adaln):
+                    nn.init.kaiming_uniform_(_head.up.weight, a=math.sqrt(5))
+                    if _head.up.bias is not None:
+                        nn.init.zeros_(_head.up.bias)
                 self.embodiment.render_adaln_gate.zero_()
                 self.embodiment.state_adaln_gate.zero_()
                 for adapter in self.embodiment.adapters.values():
-                    adapter.attn.out_proj.weight.zero_()
+                    # KEEP attn.out_proj kaiming (don't zero) — same dual-zero
+                    # reasoning as render_to_adaln/state_to_adaln above.
+                    # Identity-at-init still holds because gate=0.
+                    nn.init.kaiming_uniform_(
+                        adapter.attn.out_proj.weight, a=math.sqrt(5)
+                    )
                     if adapter.attn.out_proj.bias is not None:
-                        adapter.attn.out_proj.bias.zero_()
+                        nn.init.zeros_(adapter.attn.out_proj.bias)
+                    # CRITICAL: nn.MultiheadAttention.in_proj_weight (the
+                    # combined Q/K/V projection) is silently zero-init'd by
+                    # diffusers `_init_weights` for any module not present in
+                    # the loaded HF checkpoint — even though
+                    # MultiheadAttention.reset_parameters() would xavier-init
+                    # it. Without this re-xavier, attn(q, kv, kv) returns 0
+                    # everywhere → residual=0 → ∂L/∂gate=0 → gate never moves.
+                    # Verified empirically on 2026-05-06: in_proj_weight.norm
+                    # = 0.0 at training step 0. Apply xavier here.
+                    nn.init.xavier_uniform_(adapter.attn.in_proj_weight)
+                    if adapter.attn.in_proj_bias is not None:
+                        nn.init.zeros_(adapter.attn.in_proj_bias)
                     adapter.gate.zero_()
+                # Same fix for state_encoder's attention (also flagged as
+                # "newly initialized" by HF; in_proj_weight = 0 by default).
+                if hasattr(self.embodiment, "state_encoder") and \
+                        hasattr(self.embodiment.state_encoder, "attn"):
+                    _se_attn = self.embodiment.state_encoder.attn
+                    nn.init.xavier_uniform_(_se_attn.in_proj_weight)
+                    if _se_attn.in_proj_bias is not None:
+                        nn.init.zeros_(_se_attn.in_proj_bias)
+                # If action-aware AdaLN uses cross-attention (action_dim != None),
+                # its cross_attn also needs the same fix.
+                if getattr(self.embodiment, "use_action_aware_adaln", False):
+                    _aa = self.embodiment.action_aware_adaln
+                    if getattr(_aa, "cross_attn", None) is not None:
+                        nn.init.xavier_uniform_(_aa.cross_attn.in_proj_weight)
+                        if _aa.cross_attn.in_proj_bias is not None:
+                            nn.init.zeros_(_aa.cross_attn.in_proj_bias)
                 if getattr(self.embodiment, "use_eq5_residual", False):
                     if hasattr(self.embodiment, "render_fuse_gate"):
                         self.embodiment.render_fuse_gate.zero_()
@@ -412,9 +519,31 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                     # at identity forever.
                     self.embodiment.action_aware_adaln.gate.zero_()
             else:
-                self.render_gate.zero_()
-                if self.render_fuse.bias is not None:
-                    self.render_fuse.bias.zero_()
+                # Legacy paths:
+                #  - "egowm": no gate, no fuse; nothing to reset
+                #  - "v1": match the constructor (gate=0.1, fuse.bias=0)
+                #  - "v2": zero-init out_proj (identity-at-init) + xavier on
+                #          MHA in_proj_weight (HF/diffusers _init_weights
+                #          silently zeros it; same trap as the embodiment
+                #          adapter's adapters).
+                lrv = getattr(self, "legacy_render_variant", "egowm")
+                if lrv == "v1":
+                    self.render_gate.fill_(0.1)
+                    if self.render_fuse.bias is not None:
+                        self.render_fuse.bias.zero_()
+                elif lrv == "v2":
+                    aa = self.action_adapter
+                    nn.init.zeros_(aa.out_proj.weight)
+                    if aa.out_proj.bias is not None:
+                        nn.init.zeros_(aa.out_proj.bias)
+                    # MultiheadAttention.in_proj_weight is silently zero-init'd
+                    # by diffusers' `_init_weights` for any module not present
+                    # in the loaded HF checkpoint, even though MHA's own
+                    # reset_parameters would xavier it. Without this, the
+                    # cross-attn returns 0 forever.
+                    nn.init.xavier_uniform_(aa.cross_attn.in_proj_weight)
+                    if aa.cross_attn.in_proj_bias is not None:
+                        nn.init.zeros_(aa.cross_attn.in_proj_bias)
             # Tracks head's final layer is zero-init for "no motion at step 0".
             nn.init.zeros_(self.tracks_head.mlp[-1].weight)
             nn.init.zeros_(self.tracks_head.mlp[-1].bias)
@@ -519,28 +648,71 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
             kv_bank = cond["kv_bank"].to(dtype=hidden_states.dtype)
             temb_for_norm_out = temb_base  # (B, D)
         else:
-            # Legacy path: EgoWM Eq. 5 — pooled per-frame render summary
-            # added to the time pathway. Loses spatial information; kept
-            # only for ablation / backward-compat with existing checkpoints.
-            re_dtype = next(self.render_encoder.parameters()).dtype
-            r_tokens = self.render_encoder(
-                render_latents.to(device=hidden_states.device, dtype=re_dtype)
-            )  # (B, T_lat, inner_dim)
-            if r_tokens.shape[1] != post_patch_num_frames:
-                r_tokens = torch.nn.functional.interpolate(
-                    r_tokens.transpose(1, 2),
-                    size=post_patch_num_frames,
-                    mode="linear",
-                    align_corners=False,
-                ).transpose(1, 2)
-            rf_dtype = self.render_fuse.weight.dtype
-            z_render = self.render_fuse(r_tokens.to(dtype=rf_dtype))  # (B, T_lat, inner_dim)
-            z_render = self.render_gate.to(dtype=z_render.dtype) * z_render
-            z_render = z_render.to(dtype=temb_base.dtype)
-
-            # Broadcast per-frame render embedding to per-token.
-            z_render_per_token = z_render.repeat_interleave(tokens_per_frame, dim=1)
-            temb_per_token = temb_base.unsqueeze(1).expand(-1, num_tokens, -1) + z_render_per_token
+            lrv = getattr(self, "legacy_render_variant", "egowm")
+            if lrv == "v2":
+                # v2: per-token render features → cross_attn over actions →
+                # LayerNorm → zero-init Linear → contribution → ADD to
+                # temb_base → time_proj. No gates; identity-at-init via
+                # zero-init out_proj. Requires `actions`.
+                if actions is None:
+                    raise ValueError(
+                        "legacy_render_variant='v2' requires `actions` "
+                        "(B, T_act, action_dim) but got None."
+                    )
+                aa_dtype = next(self.action_adapter.parameters()).dtype
+                contribution = self.action_adapter(
+                    render_latents.to(device=hidden_states.device, dtype=aa_dtype),
+                    actions.to(device=hidden_states.device, dtype=aa_dtype),
+                )                                            # (B, num_tokens, D)
+                if contribution.shape[1] != num_tokens:
+                    raise RuntimeError(
+                        f"ActionConditionedTembAdapter produced "
+                        f"{contribution.shape[1]} tokens but DiT expects "
+                        f"{num_tokens}. Check spatial_downsample matches "
+                        f"Wan's patch_size."
+                    )
+                contribution = contribution.to(dtype=temb_base.dtype)
+                temb_per_token = self.action_adapter.combine_with_temb(
+                    temb_base, contribution
+                )                                            # (B, num_tokens, D)
+            elif lrv == "egowm":
+                # EgoWM-style: per-token spatial encoder → direct additive →
+                # time_proj. No gate, no fuse Linear.
+                re_dtype = next(self.render_encoder.parameters()).dtype
+                r_tokens = self.render_encoder(
+                    render_latents.to(device=hidden_states.device, dtype=re_dtype)
+                )  # (B, num_tokens, inner_dim) when spatial_pool matches patch grid
+                if r_tokens.shape[1] != num_tokens:
+                    raise RuntimeError(
+                        f"RenderSpatialEncoder produced {r_tokens.shape[1]} tokens but DiT "
+                        f"expects {num_tokens}. Check spatial_pool matches Wan's patch_size."
+                    )
+                r_tokens = r_tokens.to(dtype=temb_base.dtype)
+                temb_per_token = (
+                    temb_base.unsqueeze(1).expand(-1, num_tokens, -1) + r_tokens
+                )                                            # (B, num_tokens, D)
+            else:
+                # v1: pooled-per-frame encoder + Linear fuse + scalar gate.
+                re_dtype = next(self.render_encoder.parameters()).dtype
+                r_tokens = self.render_encoder(
+                    render_latents.to(device=hidden_states.device, dtype=re_dtype)
+                )  # (B, T_lat, inner_dim)
+                if r_tokens.shape[1] != post_patch_num_frames:
+                    r_tokens = torch.nn.functional.interpolate(
+                        r_tokens.transpose(1, 2),
+                        size=post_patch_num_frames,
+                        mode="linear",
+                        align_corners=False,
+                    ).transpose(1, 2)
+                rf_dtype = self.render_fuse.weight.dtype
+                z_render = self.render_fuse(r_tokens.to(dtype=rf_dtype))
+                z_render = self.render_gate.to(dtype=z_render.dtype) * z_render
+                z_render = z_render.to(dtype=temb_base.dtype)
+                z_render_per_token = z_render.repeat_interleave(tokens_per_frame, dim=1)
+                temb_per_token = (
+                    temb_base.unsqueeze(1).expand(-1, num_tokens, -1)
+                    + z_render_per_token
+                )                                            # (B, num_tokens, D)
 
             tp_in = ce.act_fn(temb_per_token.to(ce.time_proj.weight.dtype))
             timestep_proj = ce.time_proj(tp_in).to(dtype=temb_per_token.dtype)
@@ -560,8 +732,18 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                     and str(i) in self.embodiment.adapters
                     and kv_bank is not None
                 ):
-                    adapter = self.embodiment.adapters[str(i)]
-                    hidden_states = self._gradient_checkpointing_func(adapter, hidden_states, kv_bank)
+                    # NOT wrapping the adapter in `_gradient_checkpointing_func`:
+                    # reentrant checkpointing (the diffusers default) silently
+                    # zeros gradients to module parameters accessed via
+                    # `self.<attr>` inside the checkpointed function. We
+                    # observed `adapter.gate.grad` collapse to exactly 0
+                    # across all training steps despite ∂L/∂gate being
+                    # non-zero analytically. Calling the adapter directly
+                    # restores correct gradient flow. Memory cost is
+                    # negligible — the cross-attn over a ~5K KV bank is
+                    # tiny compared to the WanTransformerBlock that's
+                    # already checkpointed.
+                    hidden_states = self.embodiment.adapters[str(i)](hidden_states, kv_bank)
         else:
             for i, block in enumerate(self.blocks):
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
