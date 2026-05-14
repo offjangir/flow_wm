@@ -49,6 +49,9 @@ from world_model.wan_flow.embodiment_adapter import (
 from world_model.wan_flow.embodiment_adapter_v2 import (
     ActionConditionedTembAdapter,
 )
+from world_model.wan_flow.embodiment_adapter_v3 import (
+    ActionRenderConcatAdapter,
+)
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -330,19 +333,30 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
         #   * "v1"     (BACKWARD-COMPAT): pooled-per-frame render encoder +
         #              render_fuse Linear + scalar render_gate(=0.1) → adds
         #              to temb. Original variant; kept as an ablation baseline.
-        #   * "v2"     (NEW, action-conditioned): ``ActionConditionedTembAdapter``
+        #   * "v2"     (action-conditioned, cross-attn): ``ActionConditionedTembAdapter``
         #              from ``embodiment_adapter_v2``. Per-token render features
         #              cross-attend over the action trajectory; LayerNorm +
         #              zero-init Linear projects to inner_dim and the result is
         #              ADDED to temb_base BEFORE time_proj. Identity-at-init via
-        #              zero-init out_proj (no gates). Requires ``actions`` in
-        #              forward().
+        #              zero-init out_proj. Suffers a bias-direction attractor
+        #              because cross_attn output ∈ span(V·W_v) and V comes from
+        #              an 8-d action stream — observed universal tint.
+        #   * "v3"     (NEW, action-conditioned, concat): ``ActionRenderConcatAdapter``
+        #              from ``embodiment_adapter_v3``. Per-(t, h, w) token-wise
+        #              concat of render and broadcast action features → MLP →
+        #              zero-init Linear. No softmax / V-span constraint, so the
+        #              per-scene render diversity flows through with full rank.
+        #              Designed to avoid v2's bias-direction trap.
         legacy_render_variant: str = "egowm",
         # Kwargs forwarded to ``ActionConditionedTembAdapter`` when
         # ``legacy_render_variant="v2"`` (e.g. {"action_dim": 8, "hidden_dim":
         # 512, "num_heads": 8, "spatial_downsample": 2}). ``action_dim`` must
         # match the action-stream feature dim (8 for joint+gripper).
         v2_adapter_kwargs: Optional[Dict[str, Any]] = None,
+        # Kwargs forwarded to ``ActionRenderConcatAdapter`` when
+        # ``legacy_render_variant="v3"`` (e.g. {"action_dim": 8, "hidden_dim":
+        # 512, "spatial_downsample": 2, "action_temporal_align": "avg_pool"}).
+        v3_adapter_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             patch_size,
@@ -381,11 +395,11 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
             self.embodiment = EmbodimentAgnosticConditioning(**emb_kw)
             self.embodiment.to(torch.float32)
         else:
-            # Legacy path comes in three variants — see ``legacy_render_variant``
+            # Legacy path comes in four variants — see ``legacy_render_variant``
             # docstring on __init__ above.
-            if legacy_render_variant not in ("egowm", "v1", "v2"):
+            if legacy_render_variant not in ("egowm", "v1", "v2", "v3"):
                 raise ValueError(
-                    f"legacy_render_variant must be 'egowm', 'v1', or 'v2'; "
+                    f"legacy_render_variant must be 'egowm', 'v1', 'v2', or 'v3'; "
                     f"got {legacy_render_variant!r}"
                 )
             self.legacy_render_variant = legacy_render_variant
@@ -405,10 +419,11 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                 )
                 self.render_encoder.to(torch.float32)
             elif legacy_render_variant == "v2":
-                # NEW: action-conditioned temb adapter. Per-token render
-                # features cross-attend over actions, LayerNorm + zero-init
-                # Linear → contribution → ADD to temb_base → time_proj.
-                # No gates anywhere; identity-at-init via zero-init out_proj.
+                # Action-conditioned temb adapter (cross-attention path).
+                # Per-token render features cross-attend over actions,
+                # LayerNorm + zero-init Linear → contribution → ADD to
+                # temb_base → time_proj. Identity-at-init via zero-init
+                # out_proj. Known to suffer the bias-direction attractor.
                 v2_kw = dict(v2_adapter_kwargs or {})
                 if "action_dim" not in v2_kw:
                     raise ValueError(
@@ -422,6 +437,26 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                 v2_kw.setdefault("num_heads", 8)
                 v2_kw.setdefault("spatial_downsample", 2)
                 self.action_adapter = ActionConditionedTembAdapter(**v2_kw)
+                self.action_adapter.to(torch.float32)
+            elif legacy_render_variant == "v3":
+                # NEW: action-conditioned temb adapter (concat path).
+                # Per-(t, h, w) token-wise concat of render and broadcast
+                # action features → MLP → zero-init Linear → contribution
+                # → ADD to temb_base → time_proj. No softmax / V-span
+                # constraint, so per-scene render diversity is preserved.
+                v3_kw = dict(v3_adapter_kwargs or {})
+                if "action_dim" not in v3_kw:
+                    raise ValueError(
+                        "legacy_render_variant='v3' requires "
+                        "v3_adapter_kwargs.action_dim (e.g. 8 for "
+                        "joint_position+gripper)."
+                    )
+                v3_kw.setdefault("inner_dim", inner_dim)
+                v3_kw.setdefault("render_in_channels", render_latent_channels)
+                v3_kw.setdefault("hidden_dim", 512)
+                v3_kw.setdefault("spatial_downsample", 2)
+                v3_kw.setdefault("action_temporal_align", "avg_pool")
+                self.action_adapter = ActionRenderConcatAdapter(**v3_kw)
                 self.action_adapter.to(torch.float32)
             else:
                 # v1: original pooled-per-frame encoder + Linear fuse +
@@ -544,6 +579,21 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                     nn.init.xavier_uniform_(aa.cross_attn.in_proj_weight)
                     if aa.cross_attn.in_proj_bias is not None:
                         nn.init.zeros_(aa.cross_attn.in_proj_bias)
+                elif lrv == "v3":
+                    # v3 has no MHA. Respect the adapter's configured init
+                    # choice for out_proj — meta-materialize's
+                    # reset_parameters() may have overwritten the constructor's
+                    # init, so re-apply it here based on out_proj_init.
+                    aa = self.action_adapter
+                    init_mode = getattr(aa, "out_proj_init", "kaiming")
+                    if init_mode == "zero":
+                        nn.init.zeros_(aa.out_proj.weight)
+                        if aa.out_proj.bias is not None:
+                            nn.init.zeros_(aa.out_proj.bias)
+                    else:  # kaiming
+                        nn.init.kaiming_uniform_(aa.out_proj.weight, a=5 ** 0.5)
+                        if aa.out_proj.bias is not None:
+                            nn.init.zeros_(aa.out_proj.bias)
             # Tracks head's final layer is zero-init for "no motion at step 0".
             nn.init.zeros_(self.tracks_head.mlp[-1].weight)
             nn.init.zeros_(self.tracks_head.mlp[-1].bias)
@@ -649,15 +699,20 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
             temb_for_norm_out = temb_base  # (B, D)
         else:
             lrv = getattr(self, "legacy_render_variant", "egowm")
-            if lrv == "v2":
-                # v2: per-token render features → cross_attn over actions →
-                # LayerNorm → zero-init Linear → contribution → ADD to
-                # temb_base → time_proj. No gates; identity-at-init via
-                # zero-init out_proj. Requires `actions`.
+            if lrv in ("v2", "v3"):
+                # v2 (cross-attn): contribution = out_proj(out_norm(cross_attn(
+                #   render_Q, action_K, action_V))). Suffers V-span attractor.
+                # v3 (concat):    contribution = out_proj(fuse_act(fuse_hidden(
+                #   fuse_norm([render_token ‖ action_per_frame])))). Avoids the
+                #   attractor because input is the per-token concat, not a
+                #   softmax-weighted average of action features.
+                # Both expose the same .forward(render, actions) signature and
+                # the same .combine_with_temb static helper, so the call site
+                # is identical.
                 if actions is None:
                     raise ValueError(
-                        "legacy_render_variant='v2' requires `actions` "
-                        "(B, T_act, action_dim) but got None."
+                        f"legacy_render_variant={lrv!r} requires `actions` "
+                        f"(B, T_act, action_dim) but got None."
                     )
                 aa_dtype = next(self.action_adapter.parameters()).dtype
                 contribution = self.action_adapter(
@@ -666,7 +721,7 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                 )                                            # (B, num_tokens, D)
                 if contribution.shape[1] != num_tokens:
                     raise RuntimeError(
-                        f"ActionConditionedTembAdapter produced "
+                        f"{type(self.action_adapter).__name__} produced "
                         f"{contribution.shape[1]} tokens but DiT expects "
                         f"{num_tokens}. Check spatial_downsample matches "
                         f"Wan's patch_size."

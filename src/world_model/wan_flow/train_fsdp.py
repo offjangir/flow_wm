@@ -451,6 +451,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_tracks", type=float, default=0.1)
     p.add_argument("--ref_frame", type=int, default=0)
     p.add_argument("--max_query_points", type=int, default=-1)
+    # ---- in-training eval (every epoch, no VAE decode + at save epochs, VAE decode) ----
+    p.add_argument(
+        "--eval_every_n_epochs", type=int, default=0,
+        help="Run held-out flow-MSE eval every N epochs (0 disables all "
+             "in-training eval). Cheap: ~30 s per call.",
+    )
+    p.add_argument(
+        "--eval_csv_heldout", type=str, default=None,
+        help="Held-out metadata CSV for eval. Defaults to <output_dir>/" +
+             "../train_metadata_test.csv heuristic.",
+    )
+    p.add_argument("--eval_n_heldout_flow", type=int, default=5,
+                   help="Number of held-out samples for flow-MSE eval.")
+    p.add_argument("--eval_timesteps_per_sample", type=int, default=4,
+                   help="Random timesteps per held-out sample for flow-MSE.")
+    p.add_argument(
+        "--eval_video_at_save", action="store_true",
+        help="At every save epoch (where a render_conditioner.pt is dumped), "
+             "also run a small video eval with PSNR/SSIM. Re-loads VAE on "
+             "rank 0 temporarily.",
+    )
+    p.add_argument("--eval_n_heldout_video", type=int, default=3,
+                   help="Number of held-out samples for video PSNR/SSIM eval.")
+    p.add_argument("--eval_n_train_video", type=int, default=2,
+                   help="Number of train samples for video PSNR/SSIM eval "
+                        "(overfit-gap signal).")
+    p.add_argument("--eval_inference_steps", type=int, default=30)
+    p.add_argument("--eval_cfg_scale", type=float, default=1.0)
     # ---- wandb ----
     p.add_argument("--wandb_project", type=str, default="wan_flow_drrobot")
     p.add_argument("--wandb_run_name", type=str, default=None)
@@ -483,7 +511,7 @@ def parse_args() -> argparse.Namespace:
         "--legacy_render_variant",
         type=str,
         default="egowm",
-        choices=("egowm", "v1", "v2"),
+        choices=("egowm", "v1", "v2", "v3"),
         help="Selects which legacy (non-embodiment-adapter) render-conditioning "
              "design to use:\n"
              "  egowm (default): per-token spatial render encoder added "
@@ -491,10 +519,13 @@ def parse_args() -> argparse.Namespace:
              "EgoWM Eq. 5–6. No actions.\n"
              "  v1 (BACKWARD-COMPAT): pooled-per-frame render encoder + Linear "
              "fuse + scalar render_gate(=0.1). Use to load existing v1 ckpts.\n"
-             "  v2 (NEW, action-conditioned): ActionConditionedTembAdapter — "
-             "render Q ← cross_attn → actions K/V → LayerNorm → zero-init "
-             "Linear → ADD to temb_base. No gates; identity-at-init via "
-             "zero-init out_proj. Requires actions in the dataset/cache.",
+             "  v2 (action-conditioned, cross-attn): render Q ← cross_attn → "
+             "actions K/V → LayerNorm → zero-init Linear → ADD to temb_base. "
+             "Suffers V-span attractor (universal-tint bug).\n"
+             "  v3 (action-conditioned, concat): per-(t, h, w) concat of "
+             "render and broadcast action features → MLP → zero-init Linear "
+             "→ ADD to temb_base. Avoids v2's bias-direction trap because "
+             "render's per-token diversity is preserved (no softmax mixing).",
     )
     p.add_argument(
         "--embodiment_kwargs",
@@ -515,6 +546,15 @@ def parse_args() -> argparse.Namespace:
              "\"spatial_downsample\": 2}). action_dim is required.",
     )
     p.add_argument(
+        "--v3_adapter_kwargs",
+        type=lambda s: json.loads(s) if isinstance(s, str) else s,
+        default=None,
+        help="JSON dict of kwargs forwarded to ActionRenderConcatAdapter "
+             "when --legacy_render_variant=v3 (e.g. "
+             "{\"action_dim\": 8, \"hidden_dim\": 512, \"spatial_downsample\": 2, "
+             "\"action_temporal_align\": \"avg_pool\"}). action_dim is required.",
+    )
+    p.add_argument(
         "--ignore_prompts",
         action="store_true",
         help="If set, use empty string for all text prompts during precompute.",
@@ -533,6 +573,7 @@ def _load_dit_only(
     embodiment_kwargs: Optional[Dict[str, Any]] = None,
     legacy_render_variant: str = "egowm",
     v2_adapter_kwargs: Optional[Dict[str, Any]] = None,
+    v3_adapter_kwargs: Optional[Dict[str, Any]] = None,
 ) -> WanTransformerRenderConditioned:
     """
     Load *only* the render-conditioned DiT (no VAE / text / image encoders).
@@ -548,6 +589,7 @@ def _load_dit_only(
         embodiment_kwargs=embodiment_kwargs,
         legacy_render_variant=legacy_render_variant,
         v2_adapter_kwargs=v2_adapter_kwargs,
+        v3_adapter_kwargs=v3_adapter_kwargs,
     )
     if local_transformer:
         dit = WanTransformerRenderConditioned.from_pretrained(
@@ -698,6 +740,95 @@ def main() -> None:
             f"(latents + prompt + image + condition + tracks)"
         )
 
+    # ----------------------------------------------------------------
+    # Phase 1b: precompute the in-training eval caches (held-out + train).
+    # Cheap: just a handful of samples. Done ONCE at startup; reused on
+    # every per-epoch eval call. We use the same _precompute_embeddings
+    # helper as the main precompute, but here run rank-0-only (the eval
+    # set is small enough that sharding adds overhead, and only rank 0
+    # consumes the cache during the eval block inside summon_full_params).
+    # ----------------------------------------------------------------
+    eval_cache_heldout_flow = None
+    eval_cache_heldout_video = None
+    eval_cache_train_video = None
+    # All ranks precompute the eval cache (small dataset). This lets every
+    # rank run the eval forward through the FSDP-sharded DiT, keeping
+    # collectives synchronized. Doing eval on rank 0 only with
+    # summon_full_params deadlocks because ranks 1-3 hit the next
+    # collective ahead of rank 0 and the NCCL watchdog kills the job.
+    if args.eval_every_n_epochs > 0:
+        # Derive held-out CSV if not explicitly given. Convention:
+        # train_metadata_train*.csv → train_metadata_test.csv (sibling file).
+        if args.eval_csv_heldout:
+            eval_csv = args.eval_csv_heldout
+        else:
+            mc = args.metadata_csv
+            # Best-effort: try sibling test split.
+            base = os.path.basename(mc)
+            sibling = os.path.join(os.path.dirname(mc), "train_metadata_test.csv")
+            eval_csv = sibling if os.path.isfile(sibling) else None
+        if not eval_csv or not os.path.isfile(eval_csv):
+            accelerator.print(
+                f"[FSDP train eval] WARN: eval_csv_heldout not found "
+                f"({eval_csv}); per-epoch eval disabled."
+            )
+        else:
+            from world_model.wan_flow.train import _precompute_embeddings
+            n_flow = max(0, int(args.eval_n_heldout_flow))
+            n_vid_hold = max(0, int(args.eval_n_heldout_video) if args.eval_video_at_save else 0)
+            n_vid_train = max(0, int(args.eval_n_train_video) if args.eval_video_at_save else 0)
+            n_heldout_total = max(n_flow, n_vid_hold)
+            if n_heldout_total > 0:
+                eval_ds_h = RenderI2VMetadataDataset(
+                    base_path=args.dataset_base_path,
+                    metadata_csv=eval_csv,
+                    num_frames=args.num_frames,
+                    height=args.height, width=args.width, repeat=1,
+                    action_stats_path=getattr(args, "action_stats_path", None),
+                    action_field=getattr(args, "action_field", "state"),
+                )
+                eval_ds_h.rows = eval_ds_h.rows[:n_heldout_total]
+                accelerator.print(
+                    f"[FSDP train eval] precomputing {len(eval_ds_h.rows)} held-out "
+                    f"samples from {eval_csv} (flow={n_flow}, video={n_vid_hold})"
+                )
+                eval_cache_full, _, eval_scheduler_obj = _precompute_embeddings(
+                    model_path=args.model_path, dataset=eval_ds_h,
+                    device=accelerator.device, height=args.height, width=args.width,
+                    num_frames=args.num_frames,
+                    max_seq_len=args.max_sequence_length,
+                    encoder_dtype=encoder_dtype,
+                    ignore_prompts=args.ignore_prompts,
+                    cache_path=None, safe_loading=True,
+                )
+                eval_cache_heldout_flow  = eval_cache_full[:n_flow]
+                eval_cache_heldout_video = eval_cache_full[:n_vid_hold]
+            if n_vid_train > 0:
+                eval_ds_t = RenderI2VMetadataDataset(
+                    base_path=args.dataset_base_path,
+                    metadata_csv=args.metadata_csv,
+                    num_frames=args.num_frames,
+                    height=args.height, width=args.width, repeat=1,
+                    action_stats_path=getattr(args, "action_stats_path", None),
+                    action_field=getattr(args, "action_field", "state"),
+                )
+                eval_ds_t.rows = eval_ds_t.rows[:n_vid_train]
+                accelerator.print(
+                    f"[FSDP train eval] precomputing {len(eval_ds_t.rows)} train-subset "
+                    f"samples for overfit-gap signal"
+                )
+                eval_cache_train_video, _, _ = _precompute_embeddings(
+                    model_path=args.model_path, dataset=eval_ds_t,
+                    device=accelerator.device, height=args.height, width=args.width,
+                    num_frames=args.num_frames,
+                    max_seq_len=args.max_sequence_length,
+                    encoder_dtype=encoder_dtype,
+                    ignore_prompts=args.ignore_prompts,
+                    cache_path=None, safe_loading=True,
+                )
+        torch.cuda.empty_cache()
+    accelerator.wait_for_everyone()
+
     # ---------------------------------------------------------------
     # Phase 2: load only the DiT on each rank, FSDP-wrap, train.
     # ---------------------------------------------------------------
@@ -707,6 +838,7 @@ def main() -> None:
         embodiment_kwargs=args.embodiment_kwargs,
         legacy_render_variant=getattr(args, "legacy_render_variant", "egowm"),
         v2_adapter_kwargs=getattr(args, "v2_adapter_kwargs", None),
+        v3_adapter_kwargs=getattr(args, "v3_adapter_kwargs", None),
     )
     n_meta = _materialize_meta_submodules(dit)
     # ``_materialize_meta_submodules`` re-runs ``reset_parameters`` on every
@@ -745,9 +877,11 @@ def main() -> None:
             if args.use_embodiment_adapter:
                 for p_ in dit.embodiment.parameters():
                     p_.requires_grad = True
-            elif getattr(dit, "legacy_render_variant", "egowm") == "v2":
-                # v2: ActionConditionedTembAdapter is the entire trainable
-                # render-conditioner. No render_encoder / render_fuse /
+            elif getattr(dit, "legacy_render_variant", "egowm") in ("v2", "v3"):
+                # v2/v3: ActionConditionedTembAdapter (cross-attn) or
+                # ActionRenderConcatAdapter (concat) is the entire trainable
+                # render-conditioner. Both expose .parameters() under
+                # `action_adapter.*`. No render_encoder / render_fuse /
                 # render_gate.
                 for p_ in dit.action_adapter.parameters():
                     p_.requires_grad = True
@@ -848,12 +982,13 @@ def main() -> None:
             )
         else:
             variant = getattr(dit, "legacy_render_variant", "egowm")
-            if variant == "v2":
+            if variant in ("v2", "v3"):
                 n_aa = sum(p.numel() for p in dit.action_adapter.parameters())
+                aa_cls = type(dit.action_adapter).__name__
                 accelerator.print(
                     f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
                     f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
-                    f"action_adapter={n_aa / 1e6:.2f}M (legacy variant='v2', no gates); "
+                    f"action_adapter={n_aa / 1e6:.2f}M  ({aa_cls}, variant={variant!r}); "
                     f"tracks_head={n_th / 1e6:.2f}M  "
                     f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
                 )
@@ -1223,8 +1358,9 @@ def main() -> None:
                         inner = accelerator.unwrap_model(dit)
                         if args.use_embodiment_adapter:
                             groups = [("embodiment", inner.embodiment)]
-                        elif getattr(inner, "legacy_render_variant", "egowm") == "v2":
-                            # v2: only the action_adapter; no render_encoder.
+                        elif getattr(inner, "legacy_render_variant", "egowm") in ("v2", "v3"):
+                            # v2/v3: only the action_adapter (cross-attn or
+                            # concat adapter); no render_encoder.
                             groups = [("action_adapter", inner.action_adapter)]
                         else:
                             # egowm: render_encoder only. v1 also adds render_fuse.
@@ -1435,12 +1571,13 @@ def main() -> None:
                                     log_payload["train/render_gate"] = float(
                                         inner_dit.render_gate.float().item()
                                     )
-                                elif lrv_log == "v2":
-                                    # v2 has no gates — diagnose via the
-                                    # zero-init out_proj weight. Its norm
-                                    # ramps from 0 as gradient flows. Stays-at-0
-                                    # would indicate the meta-materialization
-                                    # bug re-zeroed cross_attn.in_proj_weight.
+                                elif lrv_log in ("v2", "v3"):
+                                    # v2/v3 share the same out_proj diagnostic:
+                                    # zero-init weight norm should ramp from 0
+                                    # as gradient flows. Stays-at-0 would
+                                    # indicate broken init (e.g. an MHA-zero
+                                    # trap in v2 or a meta-materialization bug
+                                    # in v3).
                                     op = inner_dit.action_adapter.out_proj.weight.detach().float()
                                     log_payload["train/action_adapter_out_proj_norm"] = float(op.norm().item())
                                     log_payload["train/action_adapter_out_proj_max_abs"] = float(op.abs().max().item())
@@ -1534,10 +1671,10 @@ def main() -> None:
                     if args.use_embodiment_adapter:
                         keep_prefixes = ["embodiment."]
                         keep_exact: set = set()
-                    elif getattr(args, "legacy_render_variant", "egowm") == "v2":
-                        # v2: ActionConditionedTembAdapter lives at
-                        # `action_adapter.*`. No render_encoder / render_fuse /
-                        # render_gate in this path.
+                    elif getattr(args, "legacy_render_variant", "egowm") in ("v2", "v3"):
+                        # v2/v3: action_adapter (cross-attn or concat) is the
+                        # entire trainable conditioner. No render_encoder /
+                        # render_fuse / render_gate in either path.
                         keep_prefixes = ["action_adapter."]
                         keep_exact = set()
                     else:
@@ -1580,6 +1717,51 @@ def main() -> None:
                 del full_state
                 if accelerator.is_main_process:
                     accelerator.print(f"Saved full transformer to {save_dir}")
+
+        # ----------------------------------------------------------------
+        # In-training eval: every eval_every_n_epochs we run flow-MSE on
+        # held-out; at save epochs (if --eval_video_at_save), additionally
+        # run a small video eval with PSNR/SSIM. All ranks enter the
+        # summon_full_params collective; only rank 0 actually runs forward.
+        # ----------------------------------------------------------------
+        run_flow_eval = (
+            args.eval_every_n_epochs > 0
+            and eval_cache_heldout_flow is not None
+            and ((epoch + 1) % args.eval_every_n_epochs == 0
+                 or epoch == args.num_epochs - 1)
+        )
+        run_video_eval = (
+            args.eval_video_at_save
+            and should_save
+            and (eval_cache_heldout_video is not None or eval_cache_train_video is not None)
+        )
+        if run_flow_eval:
+            # Run flow-MSE eval on ALL ranks through the FSDP-sharded DiT.
+            # The forward issues all_gather collectives layer by layer, which
+            # requires every rank to participate. Running eval on rank 0 only
+            # (via summon_full_params) deadlocks: ranks 1-3 race ahead to the
+            # next training collective while rank 0 is mid-eval, NCCL watchdog
+            # times out at 480 s and SIGABRTs the job.
+            from world_model.wan_flow.eval_inline import flow_mse_eval
+            dit.eval()
+            t_e = time.time()
+            m = flow_mse_eval(
+                dit, eval_cache_heldout_flow, scheduler,
+                device=device, dtype=dtype,
+                num_timesteps_per_sample=int(args.eval_timesteps_per_sample),
+                seed=args.seed + abs_e,
+            )
+            dit.train()
+            if accelerator.is_main_process:
+                accelerator.print(
+                    f"[eval epoch {abs_e}] heldout flow_mse mean="
+                    f"{m['eval/heldout_flow_mse_mean']:.4f}  "
+                    f"({time.time() - t_e:.0f}s)"
+                )
+                if use_wandb:
+                    import wandb
+                    wandb.log(m, step=global_step)
+            accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         accelerator.print(f"Training complete. {global_step} steps in {time.time() - t0:.0f}s")

@@ -29,12 +29,124 @@ _CRITICAL_FIELDS = (
     "mixed_precision",
     "max_sequence_length",
     "use_embodiment_adapter",
+    # Legacy render-conditioner variant. egowm/v1/v2 instantiate different
+    # submodules under different attribute names — mismatch ⇒ strict-load
+    # silently drops every v2 action_adapter.* key into "unexpected".
+    "legacy_render_variant",
+    # v2 adapter's action_field controls which 8-d stream is fed in
+    # (`state` = joint+gripper). A mismatch evaluates the model on a
+    # distribution it never saw.
+    "action_field",
 )
 # These need a structural-equality check (dict, not scalar).
-_DEEP_FIELDS = ("embodiment_kwargs",)
+_DEEP_FIELDS = (
+    "embodiment_kwargs",
+    # v2: action_dim, hidden_dim, num_heads, spatial_downsample. Any change
+    # alters parameter shapes ⇒ load fails or loads wrong-shape weights.
+    "v2_adapter_kwargs",
+)
 # Different at eval is fine but worth a warning so the user knows what they're
 # comparing (e.g. evaluating a model trained with empty prompts on real prompts).
 _WARN_FIELDS = ("ignore_prompts",)
+
+
+def _variant_needs_actions(cfg: Dict[str, Any]) -> bool:
+    """Whether the model variant in ``cfg`` consumes the ``actions`` stream
+    at forward time. Mirrors the branching in
+    ``WanTransformerRenderConditioned.forward``:
+
+    - ``use_embodiment_adapter=True``: actions feed the embodiment when EITHER
+      ``use_action_aware_adaln=True`` OR ``action_dim`` is set in
+      ``embodiment_kwargs``. Otherwise the embodiment ignores them.
+    - legacy variants: only ``v2`` (``ActionConditionedTembAdapter``)
+      requires actions. ``egowm`` and ``v1`` ignore them.
+    """
+    if cfg.get("use_embodiment_adapter", False):
+        ek = cfg.get("embodiment_kwargs") or {}
+        return bool(ek.get("use_action_aware_adaln")) or ek.get("action_dim") is not None
+    return cfg.get("legacy_render_variant", "egowm") == "v2"
+
+
+def _expected_action_dim(cfg: Dict[str, Any]) -> Optional[int]:
+    """Action_dim the live model will read on the forward pass, or None if
+    the variant doesn't consume actions."""
+    if not _variant_needs_actions(cfg):
+        return None
+    if cfg.get("use_embodiment_adapter", False):
+        return (cfg.get("embodiment_kwargs") or {}).get("action_dim")
+    return (cfg.get("v2_adapter_kwargs") or {}).get("action_dim")
+
+
+def assert_eval_data_matches_model(
+    cfg: Dict[str, Any],
+    dataset: Any,
+    embed_cache: list,
+    *,
+    log: callable = print,
+) -> None:
+    """Audit that the eval-time data stream matches what the model variant
+    will actually consume on forward.
+
+    Fails on:
+      - variant requires actions but cache lacks them (silent ablation);
+      - variant requires actions and ``action_stats_path`` not set
+        (cache holds raw, un-normalized actions ⇒ distribution shift);
+      - cached ``actions`` action_dim != model's expected action_dim
+        (shape mismatch ⇒ runtime crash or wrong weights consumed).
+
+    Warns (no raise) on:
+      - variant does NOT consume actions but cache has them (wasted I/O,
+        no correctness issue — model branch ignores them).
+    """
+    needs = _variant_needs_actions(cfg)
+    has_actions_in_cache = bool(embed_cache) and "actions" in embed_cache[0]
+    variant_name = (
+        "embodiment_adapter"
+        if cfg.get("use_embodiment_adapter", False)
+        else f"legacy:{cfg.get('legacy_render_variant', 'egowm')}"
+    )
+    log(f"[data-audit] variant={variant_name}  needs_actions={needs}  "
+        f"cache_has_actions={has_actions_in_cache}")
+
+    if needs and not has_actions_in_cache:
+        raise RuntimeError(
+            f"[data-audit] model variant {variant_name!r} consumes the actions "
+            f"stream on forward, but the eval cache has none. Causes: "
+            f"(a) eval CSV's 'actions' column is empty/missing; "
+            f"(b) cfg.action_stats_path missing so the dataset bypassed "
+            f"actions; (c) the v2 / action-aware-adaln cfg is wrong. "
+            f"Forward would either raise (v2) or silently run with actions=None "
+            f"(embodiment+action_aware) — neither is a valid eval."
+        )
+
+    if needs and not cfg.get("action_stats_path"):
+        raise RuntimeError(
+            f"[data-audit] {variant_name!r} needs actions but cfg.action_stats_path "
+            f"is empty. Cache holds un-normalized actions; the model was trained "
+            f"on z-scored actions, so this evaluates on a distribution shift. "
+            f"Set action_stats_path to the same stats file used at training."
+        )
+
+    if needs and has_actions_in_cache:
+        expected = _expected_action_dim(cfg)
+        observed = int(embed_cache[0]["actions"].shape[-1])
+        if expected is not None and observed != expected:
+            raise RuntimeError(
+                f"[data-audit] action_dim mismatch: model expects {expected} "
+                f"(from cfg), cache has {observed} (from {cfg.get('action_field')!r} "
+                f"field of the npz). Pick the matching action_field or rebuild "
+                f"the dataset with the right one."
+            )
+        log(f"[data-audit] ✓ actions present in {len(embed_cache)} cache entries, "
+            f"action_dim={observed}, normalized via {cfg['action_stats_path']}")
+
+    if not needs and has_actions_in_cache:
+        log(f"[data-audit] △ cache has actions but variant {variant_name!r} "
+            f"ignores them on forward (harmless; only wasted precompute work).")
+
+    if not needs and not has_actions_in_cache:
+        log(f"[data-audit] ✓ variant {variant_name!r} ignores actions; cache "
+            f"correctly omits them.")
 
 
 def _resolve_train_args_for_ckpt(ckpt_path: str) -> Optional[Path]:

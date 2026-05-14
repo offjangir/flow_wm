@@ -274,6 +274,20 @@ def main() -> None:
     p.add_argument("--out_dir", required=True)
     p.add_argument("--ignore_prompts", action="store_true", default=None)
     p.add_argument(
+        "--bias_subtract_npz", default=None,
+        help="Path to an .npz file containing key 'shared_dir' (shape (D,)) "
+             "— typically generations/v2_81f_epoch_29_bias_probe.npz. When set, "
+             "the v2 action_adapter.out_proj output gets `bias_scale * shared_dir` "
+             "added to it at every forward pass (via a forward hook). Set "
+             "bias_scale < 0 to remove the bias; >0 to amplify it.",
+    )
+    p.add_argument(
+        "--bias_scale", type=float, default=0.0,
+        help="Multiplier applied to shared_dir before adding to contribution. "
+             "0 = no change (default), -1 = full subtraction, -0.5 = half "
+             "subtract, +1 = double the bias.",
+    )
+    p.add_argument(
         "--no_strict_args", action="store_true",
         help="Skip the train/eval arg-mismatch check. Default: error on any "
              "critical mismatch (model_path, num_frames, embodiment_kwargs, ...).",
@@ -338,12 +352,42 @@ def main() -> None:
         embodiment_kwargs=cfg.get("embodiment_kwargs"),
         legacy_render_variant=cfg.get("legacy_render_variant", "egowm"),
         v2_adapter_kwargs=cfg.get("v2_adapter_kwargs"),
+        v3_adapter_kwargs=cfg.get("v3_adapter_kwargs"),
     )
     _materialize_meta_submodules(dit)
     if hasattr(dit, "reset_zero_gates"):
         dit.reset_zero_gates()
     _load_ckpt_subset(dit, args.ckpt)
     dit = dit.to(device=device, dtype=dtype).eval()
+
+    # ---- 2a. (optional) bias-direction debug hook ────────────────────────
+    # Adds `bias_scale * shared_dir` to action_adapter.out_proj's output on
+    # every forward pass. shared_dir is a (D,) tensor measured offline from
+    # the v2 action_adapter (see scripts/probe_action_adapter_bias.py).
+    # Used to test whether the universal "tint" is caused by the shared
+    # bias direction baked into out_proj. bias_scale = -1 fully removes
+    # the bias direction; +1 doubles it. 0 is a no-op (default).
+    if args.bias_subtract_npz is not None and abs(args.bias_scale) > 1e-9:
+        import numpy as np
+        blob = np.load(args.bias_subtract_npz)
+        if "shared_dir" not in blob.files:
+            raise KeyError(f"{args.bias_subtract_npz} missing 'shared_dir' key")
+        shared_dir = torch.from_numpy(blob["shared_dir"]).to(
+            device=device, dtype=dtype,
+        )  # (D,)
+        assert shared_dir.ndim == 1, f"shared_dir must be 1D, got {shared_dir.shape}"
+        scale_t = torch.tensor(args.bias_scale, device=device, dtype=dtype)
+        print(f"[gen] BIAS-HOOK installed on action_adapter.out_proj  "
+              f"scale={args.bias_scale}  shared_dir.norm={shared_dir.float().norm().item():.4f}  "
+              f"npz={args.bias_subtract_npz}")
+        def _bias_hook(_module, _inp, out):
+            # out: (B, num_tokens, D)  — broadcast add (D,) per channel
+            return out + scale_t * shared_dir
+        if not hasattr(dit, "action_adapter"):
+            raise RuntimeError(
+                "bias hook requires legacy_render_variant='v2' (no action_adapter found)"
+            )
+        dit.action_adapter.out_proj.register_forward_hook(_bias_hook)
 
     # ---- 3. load VAE for decoding (precompute deletes its instance) ----
     print("[gen] loading VAE for decode …")

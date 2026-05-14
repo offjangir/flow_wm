@@ -57,28 +57,57 @@ from world_model.wan_flow.train import (                                   # noq
     condition_usage_sanity,
 )
 from world_model.wan_flow.train_fsdp import _load_dit_only                 # noqa: E402
-from _eval_common import verify_eval_matches_training                       # noqa: E402
+from _eval_common import (                                                  # noqa: E402
+    _resolve_train_args_for_ckpt,
+    assert_eval_data_matches_model,
+    verify_eval_matches_training,
+)
 
 
-def _load_render_conditioner_subset(model: torch.nn.Module, ckpt_path: str) -> None:
+def _load_render_conditioner_subset(
+    model: torch.nn.Module, ckpt_path: str, expected_variant: str | None = None
+) -> None:
     """The training run saves ONLY the trainable subset of params (render
     conditioner + tracks_head + last N unfrozen blocks). Load these with
-    ``strict=False`` so the rest of Wan stays at its pretrained values."""
+    ``strict=False`` so the rest of Wan stays at its pretrained values.
+
+    Fails loud on:
+      - any ``unexpected`` key (architecture mismatch — e.g. v2 ckpt loaded
+        into an egowm-built DiT silently drops all 26 action_adapter.* keys);
+      - missing v2 ``action_adapter.*`` coverage when the live model is v2
+        (would leave the adapter at xavier+zero-init = identity at eval).
+    """
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    # Some checkpoints save fp32 tensors; cast to whatever the live model uses.
     target_dtype = next(model.parameters()).dtype
-    sd_cast = {}
-    for k, v in sd.items():
-        if isinstance(v, torch.Tensor) and v.is_floating_point():
-            sd_cast[k] = v.to(dtype=target_dtype)
-        else:
-            sd_cast[k] = v
+    sd_cast = {
+        k: (v.to(dtype=target_dtype)
+            if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+        for k, v in sd.items()
+    }
     missing, unexpected = model.load_state_dict(sd_cast, strict=False)
     n_loaded = len(sd_cast) - len(unexpected)
     print(f"[ckpt] loaded {n_loaded}/{len(sd_cast)} tensors from {ckpt_path}")
     if unexpected:
-        print(f"[ckpt] WARN unexpected keys (first 5): {unexpected[:5]}")
-    # `missing` is huge here (everything we DIDN'T train) — no need to print.
+        raise RuntimeError(
+            f"[ckpt] {len(unexpected)} key(s) in the checkpoint have no target in "
+            f"the live model — architecture mismatch. First 8: {unexpected[:8]}. "
+            f"This typically means --config / args.json disagrees with the ckpt's "
+            f"legacy_render_variant / use_embodiment_adapter / v2_adapter_kwargs."
+        )
+
+    if expected_variant in ("v2", "v3"):
+        live = {n for n, _ in model.named_parameters() if n.startswith("action_adapter.")}
+        loaded = {k for k in sd_cast if k.startswith("action_adapter.")}
+        unfilled = live - loaded
+        if unfilled:
+            raise RuntimeError(
+                f"[ckpt] {expected_variant} model has {len(unfilled)} action_adapter.* "
+                f"parameter(s) with no value in the checkpoint — adapter would run at "
+                f"xavier/zero init (identity) instead of trained weights. Missing "
+                f"(first 8): {sorted(unfilled)[:8]}"
+            )
+        print(f"[ckpt] {expected_variant}: all {len(loaded)} action_adapter.* tensors "
+              f"filled from ckpt")
 
 
 @torch.no_grad()
@@ -161,7 +190,11 @@ def eval_flow_loss(
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="Training config JSON to inherit settings from.")
+    p.add_argument(
+        "--config", default=None,
+        help="Training config JSON to inherit settings from. If omitted, auto-resolves "
+             "to the args.json saved alongside --ckpt (run_*/args.json).",
+    )
     p.add_argument("--ckpt",   required=True, help="Path to render_conditioner.pt (the trainable subset).")
     p.add_argument("--eval_csv", required=True, help="Held-out metadata CSV (default: 10-video subset).")
     p.add_argument(
@@ -197,10 +230,22 @@ def main() -> None:
     )
     args = p.parse_args()
 
+    if args.config is None:
+        resolved = _resolve_train_args_for_ckpt(args.ckpt)
+        if resolved is None:
+            raise SystemExit(
+                f"[eval] --config not given and no args.json found near {args.ckpt}. "
+                f"Pass --config explicitly."
+            )
+        args.config = str(resolved)
+        print(f"[eval] --config not given; using {args.config} (adjacent to ckpt)")
+
     cfg = json.load(open(args.config))
     # Sanity: this checkpoint must have been trained with the same architecture
     # / shapes / dtype the eval is using. Otherwise load_state_dict silently
-    # mismatches and we evaluate on partially-loaded weights.
+    # mismatches and we evaluate on partially-loaded weights. Auto-resolved
+    # config will tautologically match — keep the check anyway in case the
+    # user passes an explicit --config that disagrees.
     verify_eval_matches_training(cfg, args.ckpt, strict=not args.no_strict_args)
 
     device = torch.device(args.device)
@@ -254,6 +299,11 @@ def main() -> None:
     )
     print(f"[eval] cached {len(embed_cache)} samples")
 
+    # ---- 2b. audit that the data the cache contains matches what the model
+    #          variant will consume on forward (catches silent action-stream
+    #          ablations, distribution shifts, action_dim mismatches). ----
+    assert_eval_data_matches_model(cfg, eval_dataset, embed_cache)
+
     # ---- 3. build DiT, load checkpoint subset ----
     print(f"[eval] building DiT and loading subset checkpoint…")
     dit = _load_dit_only(
@@ -262,11 +312,15 @@ def main() -> None:
         embodiment_kwargs=cfg.get("embodiment_kwargs"),
         legacy_render_variant=cfg.get("legacy_render_variant", "egowm"),
         v2_adapter_kwargs=cfg.get("v2_adapter_kwargs"),
+        v3_adapter_kwargs=cfg.get("v3_adapter_kwargs"),
     )
     _materialize_meta_submodules(dit)
     if hasattr(dit, "reset_zero_gates"):
         dit.reset_zero_gates()
-    _load_render_conditioner_subset(dit, args.ckpt)
+    _load_render_conditioner_subset(
+        dit, args.ckpt,
+        expected_variant=cfg.get("legacy_render_variant", "egowm"),
+    )
     dit = dit.to(device=device, dtype=dtype).eval()
 
     # ---- 4. flow loss on held-out ----

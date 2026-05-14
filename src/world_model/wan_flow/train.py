@@ -778,12 +778,13 @@ def parse_args() -> argparse.Namespace:
         "--legacy_render_variant",
         type=str,
         default="egowm",
-        choices=("egowm", "v1", "v2"),
+        choices=("egowm", "v1", "v2", "v3"),
         help="Which legacy (non-embodiment-adapter) variant: 'egowm' "
              "(per-token spatial, no actions, no gate), 'v1' (BACKWARD-COMPAT "
-             "pooled + fuse + scalar gate), or 'v2' (NEW, "
-             "ActionConditionedTembAdapter, per-token cross-attn over actions, "
-             "zero-init out_proj, no gates). See train_fsdp.py for details.",
+             "pooled + fuse + scalar gate), 'v2' (cross-attn over actions, "
+             "suffers V-span bias attractor), or 'v3' (NEW, concat of render "
+             "and action features → MLP, designed to avoid v2's bias trap). "
+             "See train_fsdp.py for details.",
     )
     p.add_argument(
         "--v2_adapter_kwargs",
@@ -791,6 +792,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSON dict forwarded to ActionConditionedTembAdapter when "
              "--legacy_render_variant=v2. Required key: action_dim.",
+    )
+    p.add_argument(
+        "--v3_adapter_kwargs",
+        type=lambda s: json.loads(s) if isinstance(s, str) else s,
+        default=None,
+        help="JSON dict forwarded to ActionRenderConcatAdapter when "
+             "--legacy_render_variant=v3. Required key: action_dim.",
     )
     if defaults:
         p.set_defaults(**{k: v for k, v in defaults.items() if k != "config"})
@@ -1314,6 +1322,7 @@ def main() -> None:
         use_embodiment_adapter=bool(args.use_embodiment_adapter),
         legacy_render_variant=getattr(args, "legacy_render_variant", "egowm"),
         v2_adapter_kwargs=getattr(args, "v2_adapter_kwargs", None),
+        v3_adapter_kwargs=getattr(args, "v3_adapter_kwargs", None),
     )
     if local_transformer:
         dit = WanTransformerRenderConditioned.from_pretrained(os.path.join(root, "transformer"), **tkw)
@@ -1343,9 +1352,10 @@ def main() -> None:
         if args.use_embodiment_adapter:
             for p_ in dit.embodiment.parameters():
                 p_.requires_grad = True
-        elif getattr(dit, "legacy_render_variant", "egowm") == "v2":
-            # v2: ActionConditionedTembAdapter is the entire trainable
-            # render-conditioner; no render_encoder / render_fuse / render_gate.
+        elif getattr(dit, "legacy_render_variant", "egowm") in ("v2", "v3"):
+            # v2/v3: action_adapter (cross-attn or concat) is the entire
+            # trainable render-conditioner; no render_encoder / render_fuse /
+            # render_gate.
             for p_ in dit.action_adapter.parameters():
                 p_.requires_grad = True
         else:
@@ -1422,12 +1432,13 @@ def main() -> None:
         )
     else:
         variant = getattr(dit, "legacy_render_variant", "egowm")
-        if variant == "v2":
+        if variant in ("v2", "v3"):
             n_aa = sum(p.numel() for p in dit.action_adapter.parameters())
+            aa_cls = type(dit.action_adapter).__name__
             accelerator.print(
                 f"[train] DiT: {n_total/1e9:.2f}B total, {n_trainable/1e6:.1f}M trainable "
                 f"({100*n_trainable/n_total:.2f}%); action_adapter: {n_aa/1e6:.2f}M "
-                f"(legacy variant='v2', no gates); tracks_head: {n_th/1e6:.2f}M  "
+                f"({aa_cls}, variant={variant!r}); tracks_head: {n_th/1e6:.2f}M  "
                 f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
             )
         else:
@@ -1815,8 +1826,8 @@ def main() -> None:
                 if args.use_embodiment_adapter:
                     keep_prefixes = ["embodiment."]
                     keep_exact: set = set()
-                elif getattr(unwrapped, "legacy_render_variant", "egowm") == "v2":
-                    # v2: ActionConditionedTembAdapter at `action_adapter.*`.
+                elif getattr(unwrapped, "legacy_render_variant", "egowm") in ("v2", "v3"):
+                    # v2/v3: action_adapter (cross-attn or concat) at `action_adapter.*`.
                     keep_prefixes = ["action_adapter."]
                     keep_exact = set()
                 else:

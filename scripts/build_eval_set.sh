@@ -17,11 +17,14 @@
 #   N_EPS=10              sample size
 #   SEED=99               sampling seed
 #   GPUS="0 1 2 3"        GPUs for the render+tracks step (avoid GPUs in use)
+#   PY=python3            interpreter (override: PY=/your/conda/bin/python ...)
 #
 set -euo pipefail
 
-REPO=/weka/scratch/hbharad2/users/yjangir1/flow_wm
-PY=/home/yjangir1/scratchhbharad2/users/yjangir1/conda-envs/dr/bin/python
+# Repo root = parent of this script's directory (no hardcoded WEKA/home paths).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Override if needed, e.g. PY=/path/to/conda-env/bin/python bash scripts/build_eval_set.sh
+PY="${PY:-python3}"
 N_EPS="${N_EPS:-10}"
 SEED="${SEED:-99}"
 GPUS="${GPUS:-0 1 2 3}"
