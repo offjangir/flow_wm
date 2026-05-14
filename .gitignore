@@ -17,6 +17,9 @@ wandb/
 # Data and Models
 data/
 data_wan/
+data_wan_1k/
+data_wan_eval/
+drrobot/franka_emika_panda_complement1/
 *.safetensors
 
 # Evaluation & Outputs
@@ -27,6 +30,11 @@ eval_outputs_gate1/
 
 # Third Party / Submodules
 DiffSynth-Studio/
+alltracker/
 
 # Logs
 *.log
+logs/
+
+# Misc
+hardcopy.txt
