@@ -1,5 +1,5 @@
 {
-  "panda":    "/weka/scratch/hbharad2/users/yjangir1/flow_wm/drrobot/franka_emika_panda_complement1",
-  "humanoid": "/weka/scratch/hbharad2/users/yjangir1/flow_wm/checkpoints/drrobot_humanoid",
-  "widowx":   "/weka/scratch/hbharad2/users/yjangir1/flow_wm/checkpoints/drrobot_widowx"
+  "panda": "../drrobot/output/franka_emika_panda_complement1",
+  "humanoid": "../drrobot/drrobot_humanoid",
+  "widowx": "../drrobot/drrobot_widowx"
 }

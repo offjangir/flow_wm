@@ -84,6 +84,13 @@ done
 : "${SKIP_TRACKS:=0}"
 : "${SKIP_METADATA:=0}"
 
+# Force a clean compute_90 arch list. On GH200 (sm_90) torch reports both
+# 'sm_90' and 'sm_90a' in get_arch_list(); gsplat's CUDA-extension loader
+# parses each entry as int(arch.removeprefix('sm_')) and dies on '90a'. Pinning
+# to "9.0" keeps the JIT compile + .so reload happy without losing performance
+# (sm_90a additions are unused by gsplat). Do not collapse to TORCH_CUDA_ARCH=9.0a.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
+
 # ─── Sanity ──────────────────────────────────────────────────────────────────
 [[ -d "${DROID_ROOT}" ]] || { echo "ERROR: DROID_ROOT not a directory: ${DROID_ROOT}"; exit 1; }
 if [[ "${SKIP_RENDER}" != "1" ]]; then

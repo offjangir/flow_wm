@@ -763,6 +763,12 @@ def main() -> None:
                    help="Optional per-clip frame cap (0 = no cap).")
     p.add_argument("--max_scenes", type=int, default=0,
                    help="Optional scene cap (0 = process all).")
+    p.add_argument("--num_shards", type=int, default=1,
+                   help="Split the (sorted) clip list into this many disjoint "
+                        "shards for parallel multi-GPU extraction.")
+    p.add_argument("--shard_idx", type=int, default=0,
+                   help="Which shard (0-based, < --num_shards) this process "
+                        "handles: scene_clips[shard_idx::num_shards].")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing outputs instead of skipping.")
 
@@ -820,6 +826,13 @@ def main() -> None:
         scene_clips = [(mp.stem, mp) for mp in mp4s]
     if args.max_scenes > 0:
         scene_clips = scene_clips[: args.max_scenes]
+    if args.num_shards > 1:
+        if not (0 <= args.shard_idx < args.num_shards):
+            raise SystemExit(
+                f"--shard_idx must be in [0, {args.num_shards}); got {args.shard_idx}"
+            )
+        scene_clips = scene_clips[args.shard_idx :: args.num_shards]
+        print(f"[shard] {args.shard_idx + 1}/{args.num_shards}: {len(scene_clips)} clips")
     print(
         f"[plan] {len(scene_clips)} clips | save_tracks={args.save_tracks} "
         f"save_dense_flow={args.save_dense_flow} "

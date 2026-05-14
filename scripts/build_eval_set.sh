@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build a held-out 10-video evaluation set:
-#   1. Sample 10 episodes from DROID NOT in data/droid_1k/manifest.csv
+#   1. Sample 10 episodes from DROID NOT in data/droid_5k/manifest.csv
 #   2. Download trajectory.h5 + ext1 MP4 for each
 #   3. Render via DrRobot + extract AllTracker tracks
 #   4. Build data_wan_eval/eval_metadata_10.csv (same schema as training metadata)
@@ -17,11 +17,14 @@
 #   N_EPS=10              sample size
 #   SEED=99               sampling seed
 #   GPUS="0 1 2 3"        GPUs for the render+tracks step (avoid GPUs in use)
+#   PY=python3            interpreter (override: PY=/your/conda/bin/python ...)
 #
 set -euo pipefail
 
-REPO=/weka/scratch/hbharad2/users/yjangir1/flow_wm
-PY=/home/yjangir1/scratchhbharad2/users/yjangir1/conda-envs/dr/bin/python
+# Repo root = parent of this script's directory (no hardcoded WEKA/home paths).
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Override if needed, e.g. PY=/path/to/conda-env/bin/python bash scripts/build_eval_set.sh
+PY="${PY:-python3}"
 N_EPS="${N_EPS:-10}"
 SEED="${SEED:-99}"
 GPUS="${GPUS:-0 1 2 3}"
@@ -33,7 +36,7 @@ cd "$REPO"
 echo "=== $(date -Is) [1/5] Sample $N_EPS new episodes (excluding the trained 891) ===" | tee -a "$LOG"
 "$PY" scripts/sample_eval_episodes.py \
     --cache_dir data/droid_meta_cache \
-    --exclude_manifest data/droid_1k/manifest.csv \
+    --exclude_manifest data/droid_5k/manifest.csv \
     --n "$N_EPS" --seed "$SEED" \
     --out_manifest data/droid_eval/manifest.csv 2>&1 | tee -a "$LOG"
 
@@ -75,11 +78,11 @@ echo "=== $(date -Is) [5/5] Build eval_metadata via prepare_data_wan ===" | tee 
 
 # prepare_data_wan writes "metadata.csv" — rename to make purpose explicit
 mv data_wan_eval/metadata.csv data_wan_eval/eval_metadata.csv
-ln -sfn "$(realpath data_wan_eval/eval_metadata.csv)" "$REPO/data_wan_1k/eval_metadata_held_out_10.csv"
+ln -sfn "$(realpath data_wan_eval/eval_metadata.csv)" "$REPO/data_wan_5k/eval_metadata_held_out_10.csv"
 
 echo "=== $(date -Is) DONE ===" | tee -a "$LOG"
 echo "  eval CSV: data_wan_eval/eval_metadata.csv"
-echo "  symlink:  data_wan_1k/eval_metadata_held_out_10.csv  (for eval_render_conditioning.py)"
-echo "  eval hint: pass --dataset_base_path data_wan_eval (paths are under data_wan_eval/, not data_wan_1k/)"
+echo "  symlink:  data_wan_5k/eval_metadata_held_out_10.csv  (for eval_render_conditioning.py)"
+echo "  eval hint: pass --dataset_base_path data_wan_eval (paths are under data_wan_eval/, not data_wan_5k/)"
 ls -lh data_wan_eval/eval_metadata.csv
 wc -l data_wan_eval/eval_metadata.csv

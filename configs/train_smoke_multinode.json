@@ -1,0 +1,43 @@
+{
+  "_comment": "Smoke test config for the multinode launch script. 1 epoch over the 10-sample data_wan dataset, no checkpoint write, wandb offline. Should finish in well under 30 minutes once precompute is done.",
+
+  "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+  "dataset_base_path": "./data_wan",
+  "metadata_csv": "./data_wan/metadata.csv",
+  "output_dir": "./checkpoints/wan_smoke_multinode",
+
+  "num_frames": 17,
+  "height": 320,
+  "width": 576,
+
+  "dataset_repeat": 1,
+  "num_epochs": 1,
+  "save_every_n_epochs": 999,
+
+  "learning_rate": 2e-5,
+  "lr_scheduler": "cosine_warmup",
+  "lr_warmup_steps": 5,
+  "lr_min_ratio": 0.05,
+  "weight_decay": 0.01,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+
+  "trainable": "render_only",
+  "unfreeze_last_n_blocks": 8,
+  "disable_render_gate": false,
+
+  "max_sequence_length": 256,
+  "mixed_precision": "bf16",
+  "num_workers": 4,
+  "log_every_n_steps": 1,
+
+  "condition_usage_sanity_samples": 0,
+  "lambda_tracks": 0.0,
+  "ref_frame": 3,
+  "max_query_points": 128,
+
+  "wandb_project": "wan_flow_drrobot",
+  "wandb_run_name": "smoke_multinode",
+  "wandb_mode": "offline"
+}
