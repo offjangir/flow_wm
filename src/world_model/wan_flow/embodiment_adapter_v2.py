@@ -154,8 +154,6 @@ class ActionConditionedTembAdapter(nn.Module):
 
         self.out_norm = nn.LayerNorm(inner_dim)
         self.out_proj = nn.Linear(inner_dim, inner_dim)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
     def forward(
         self,

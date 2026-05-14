@@ -1,0 +1,75 @@
+{
+  "_comment_target": "Action-conditioned v3 (ActionRenderCrossAdapterV3, model_v3.py) on the full 802-clip droid_1k train split, FSDP. v3 = 3-layer render encoder + 2-layer action encoder, LayerNorm on both, 2 TRADITIONAL pre-norm transformer blocks (residual cross-attn + residual FFN, render Q / action KV), 2-layer projection ADDED to temb_base before time_proj. Standard PyTorch init throughout — NO zero-init, NO small-init; the residual blocks are the stability mechanism. This is the fix for the v2 collapse/divergence (see memory:project_v2_adapter_collapse). 17 frames @ 240x432, 30 epochs — direct A/B against the egowm 30-epoch baseline (run_20260507_052841, ~16.2 dB) at matched resolution + length. Validated by the 10-vid x 10-epoch smoke: val loss 1.52 -> 0.33 monotonic, grad_norm bounded.",
+
+  "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+  "dataset_base_path": "data_wan_1k",
+  "_metadata_note": "Full 802-row train split — matches the egowm baseline's metadata exactly.",
+  "metadata_csv": "data_wan_1k/train_metadata_train.csv",
+  "output_dir": "./checkpoints/wan_render_drrobot_1k_legacy_8xl40_action_aware_v3",
+
+  "_num_frames_note": "17 = matches egowm baseline + v2 runs. T_lat=5 post-patch frames x 30x54 spatial = 8100 tokens.",
+  "num_frames": 17,
+  "height": 240,
+  "width": 432,
+
+  "action_stats_path": "data_wan_1k/action_stats.json",
+  "action_field": "state",
+
+  "_cache_note": "v3 17-frame cache. Cache key is data-only (data + num_frames + has_actions + action_field), NOT architecture-dependent — so this is data-identical to the v2 17-frame cache. Separate filename to avoid confusion; first launch MISSES, rebuilds ~30 min for 802 videos.",
+  "precompute_cache_path": "data_wan_1k/precompute_cache_17f_v3.pt",
+
+  "dataset_repeat": 1,
+  "num_epochs": 30,
+  "_save_note": "save_every_n_epochs=10 (epochs 9,19,29 = 3 saves x ~13GB = ~39GB). Kept sparse because /work/nvme/becx is at ~886G/1000G soft with 3 other runs also saving.",
+  "save_every_n_epochs": 10,
+
+  "learning_rate": 2e-05,
+  "gate_lr_multiplier": 1.0,
+  "lr_scheduler": "cosine_warmup",
+  "lr_warmup_steps": 200,
+  "lr_min_ratio": 0.0,
+  "weight_decay": 0.001,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+
+  "trainable": "render_only",
+  "unfreeze_last_n_blocks": 8,
+  "disable_render_gate": false,
+
+  "max_sequence_length": 256,
+  "mixed_precision": "bf16",
+  "num_workers": 4,
+  "log_every_n_steps": 1,
+
+  "condition_usage_sanity_samples": 0,
+  "render_dropout_prob": 0.1,
+
+  "lambda_tracks": 0.1,
+  "ref_frame": 1,
+  "max_query_points": 128,
+
+  "ignore_prompts": true,
+
+  "use_embodiment_adapter": false,
+  "legacy_render_variant": "v3",
+  "v3_adapter_kwargs": {
+    "action_dim": 8,
+    "hidden_dim": 512,
+    "num_heads": 8,
+    "num_blocks": 2,
+    "spatial_downsample": 2,
+    "ffn_mult": 4
+  },
+
+  "_val_note": "Held-out 10-scene set (scenes 10000-10009, never seen in training). Runs every 2 epochs at 4 fixed timesteps per sample, deterministic noise.",
+  "val_metadata_csv": "data_wan_eval/eval_metadata.csv",
+  "val_dataset_base_path": "data_wan_eval",
+  "val_every_n_epochs": 2,
+  "val_timesteps": 4,
+  "val_precompute_cache_path": "data_wan_eval/precompute_cache_val_17f_v3.pt",
+
+  "wandb_project": "wan_flow_drrobot",
+  "wandb_run_name": "1k_legacy_8xl40_action_aware_v3",
+  "wandb_mode": "online"
+}

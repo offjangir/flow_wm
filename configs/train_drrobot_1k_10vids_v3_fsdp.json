@@ -1,0 +1,74 @@
+{
+  "_comment_target": "FSDP smoke for legacy_render_variant=v3 (ActionRenderCrossAdapterV3, model_v3.py). 3-layer render encoder + 2-layer action encoder, LayerNorm on both, 2 TRADITIONAL pre-norm transformer blocks (residual cross-attn + residual FFN) where render tokens attend over actions, 2-layer projection ADDED to temb_base. Standard PyTorch init throughout (no zero-init, no small-init). 10 videos x 10 epochs x 17 frames on 4xGH200, ~10-15 min. Smoke goals: (1) plumbing runs end-to-end, (2) loss does NOT diverge (v2 went 1.66->2.45 in 3 epochs — v3 should descend or stay flat), (3) train/v3_block0_qkv_std DRIFTS from init (v2's failure was QKV welded at init), (4) val loss logs every epoch.",
+
+  "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+  "dataset_base_path": "data_wan_1k",
+  "metadata_csv": "data_wan_1k/train_metadata_10.csv",
+  "output_dir": "./checkpoints/wan_render_drrobot_1k_10vids_v3_fsdp",
+
+  "_num_frames_note": "17 frames matches the egowm baseline + the v2 runs. T_lat=5 post-patch frames x 30x54 spatial = 8100 tokens. Fast smoke.",
+  "num_frames": 17,
+  "height": 240,
+  "width": 432,
+
+  "_action_note": "8-d state (joint_position 7 + gripper 1) z-scored against train-split stats. At num_frames=17 the action K/V bank for the v3 cross-attn blocks is 17 tokens.",
+  "action_stats_path": "data_wan_1k/action_stats.json",
+  "action_field": "state",
+
+  "_cache_note": "Distinct cache: key includes 10-vid CSV + has_actions + num_frames=17. The v2 10-vid cache (precompute_cache_10vids_v2_17f.pt) is data-identical so this could in principle reuse it, but a separate file avoids any confusion. First launch MISSES (~30 sec for 10 videos through the VAE).",
+  "precompute_cache_path": "data_wan_1k/precompute_cache_10vids_v3_17f.pt",
+
+  "dataset_repeat": 1,
+  "num_epochs": 10,
+  "save_every_n_epochs": 10,
+
+  "learning_rate": 2e-05,
+  "gate_lr_multiplier": 1.0,
+  "lr_scheduler": "cosine_warmup",
+  "lr_warmup_steps": 5,
+  "lr_min_ratio": 0.0,
+  "weight_decay": 0.001,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+
+  "trainable": "render_only",
+  "unfreeze_last_n_blocks": 8,
+  "disable_render_gate": false,
+
+  "max_sequence_length": 256,
+  "mixed_precision": "bf16",
+  "num_workers": 2,
+  "log_every_n_steps": 1,
+
+  "condition_usage_sanity_samples": 0,
+  "render_dropout_prob": 0.1,
+
+  "lambda_tracks": 0.1,
+  "ref_frame": 1,
+  "max_query_points": 128,
+
+  "ignore_prompts": true,
+
+  "use_embodiment_adapter": false,
+  "legacy_render_variant": "v3",
+  "v3_adapter_kwargs": {
+    "action_dim": 8,
+    "hidden_dim": 512,
+    "num_heads": 8,
+    "num_blocks": 2,
+    "spatial_downsample": 2,
+    "ffn_mult": 4
+  },
+
+  "_val_note": "Same 10-scene held-out set used by the other v2/v3 configs. Val every epoch so the smoke surfaces val-pass bugs immediately.",
+  "val_metadata_csv": "data_wan_eval/eval_metadata.csv",
+  "val_dataset_base_path": "data_wan_eval",
+  "val_every_n_epochs": 1,
+  "val_timesteps": 4,
+  "val_precompute_cache_path": "data_wan_eval/precompute_cache_val_17f_v3.pt",
+
+  "wandb_project": "wan_flow_drrobot",
+  "wandb_run_name": "1k_10vids_v3_17f_smoke",
+  "wandb_mode": "online"
+}

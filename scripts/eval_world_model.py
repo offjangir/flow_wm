@@ -115,6 +115,18 @@ def parse_args() -> argparse.Namespace:
                    help="Use diffusers' model CPU offload (each submodule lives on CPU "
                         "and is moved to GPU only for its forward). Required on a single "
                         "48 GB card; pass --no-cpu_offload on H100/A100-80GB for max speed.")
+    p.add_argument("--force_empty_prompt", action="store_true",
+                   help="Ignore the CSV `prompt` column and feed an empty string to the text "
+                        "encoder. Use this when the checkpoint was trained with "
+                        "`ignore_prompts: true` (text encoder always saw \"\" during training).")
+    # ---- v2 action-conditioned path ----
+    p.add_argument("--action_stats_path", type=str, default=None,
+                   help="z-score stats JSON for action normalization. Required for v2 "
+                        "checkpoints trained with action_stats_path set; pass the same "
+                        "file that was used at training time.")
+    p.add_argument("--action_field", type=str, default="state",
+                   help="Field name in actions/<scene>.npz. 'state' = 8-d joint+gripper "
+                        "(default); 'action' = 7-d commanded target+gripper.")
     return p.parse_args()
 
 
@@ -194,6 +206,45 @@ def _hstack_rows(*videos_uint8: np.ndarray, gap: int = 4) -> np.ndarray:
             pieces.append(spacer)
         pieces.append(v)
     return np.concatenate(pieces, axis=2)  # along width
+
+
+def _per_frame_psnr_ssim(pred: np.ndarray, ref: np.ndarray) -> dict:
+    """Compute mean PSNR/SSIM/MSE between two (T,H,W,3) uint8 arrays. Per-frame, then averaged.
+
+    SSIM uses channel_axis=-1 (RGB), data_range=255. PSNR uses data_range=255.
+    MSE is reported in normalized [0,1]² pixel space (uint8 / 255.0) so it's
+    invariant to the integer encoding and directly comparable to losses
+    reported in normalized space.
+    """
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+    assert pred.shape == ref.shape, f"shape mismatch: {pred.shape} vs {ref.shape}"
+    T = pred.shape[0]
+    psnr_per = np.empty(T, dtype=np.float64)
+    ssim_per = np.empty(T, dtype=np.float64)
+    mse_per = np.empty(T, dtype=np.float64)
+    pred_n = pred.astype(np.float64) / 255.0
+    ref_n = ref.astype(np.float64) / 255.0
+    for t in range(T):
+        psnr_per[t] = peak_signal_noise_ratio(ref[t], pred[t], data_range=255)
+        ssim_per[t] = structural_similarity(
+            ref[t], pred[t], data_range=255, channel_axis=-1
+        )
+        mse_per[t] = float(np.mean((pred_n[t] - ref_n[t]) ** 2))
+    return {
+        "psnr_per_frame": psnr_per.tolist(),
+        "ssim_per_frame": ssim_per.tolist(),
+        "mse_per_frame": mse_per.tolist(),
+        "psnr_mean": float(psnr_per.mean()),
+        "ssim_mean": float(ssim_per.mean()),
+        "mse_mean": float(mse_per.mean()),
+        "psnr_frame0": float(psnr_per[0]),
+        "ssim_frame0": float(ssim_per[0]),
+        "mse_frame0": float(mse_per[0]),
+        "psnr_last": float(psnr_per[-1]),
+        "ssim_last": float(ssim_per[-1]),
+        "mse_last": float(mse_per[-1]),
+    }
 
 
 def _label_frames(frames: np.ndarray, label: str, band_h: int = 24) -> np.ndarray:
@@ -374,13 +425,35 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Resolve action stats once (z-score normalization).
+    # Needed for v2 (legacy_render_variant='v2') checkpoints; harmless for egowm
+    # (no `actions` ever read from cache).
+    is_v2 = (
+        getattr(pipe.transformer, "legacy_render_variant", None) == "v2"
+        or hasattr(pipe.transformer, "action_adapter")
+    )
+    action_stats = None
+    if is_v2 and args.action_stats_path:
+        from world_model.wan_flow.data import _load_action_stats
+        action_stats = _load_action_stats(args.action_stats_path)
+        print(f"[eval] loaded action stats from {args.action_stats_path}")
+    if is_v2 and "actions" not in df.columns:
+        raise SystemExit(
+            "v2 checkpoint requires the metadata CSV to have an 'actions' column "
+            "pointing to per-scene .npz files; not found in "
+            f"{args.metadata_csv}."
+        )
+
     summary = []
     for k, idx in enumerate(sel):
         row = df.iloc[idx].to_dict()
         vpath = _abs(row["video"])
         rpath = _abs(row["render"])
-        prompt_value = row.get("prompt", "")
-        prompt = "" if pd.isna(prompt_value) else str(prompt_value)
+        if args.force_empty_prompt:
+            prompt = ""
+        else:
+            prompt_value = row.get("prompt", "")
+            prompt = "" if pd.isna(prompt_value) else str(prompt_value)
         scene = os.path.splitext(os.path.basename(vpath))[0]
         print(f"\n[eval] [{k+1}/{len(sel)}] scene={scene}")
         print(f"        video  = {vpath}")
@@ -392,6 +465,25 @@ def main() -> None:
         gt_frames = _resize_pils(_load_video_frames(vpath, args.num_frames), args.height, args.width)
         render_frames = _resize_pils(_load_video_frames(rpath, args.num_frames), args.height, args.width)
         first_frame = gt_frames[0]
+
+        # Load per-scene actions for v2. The cross-attn KV dim is num_frames.
+        actions_tensor: Optional[torch.Tensor] = None
+        if is_v2:
+            from world_model.wan_flow.data import _load_actions_npz
+            apath_raw = row.get("actions", "")
+            if pd.isna(apath_raw) or not str(apath_raw):
+                raise SystemExit(
+                    f"row {idx}: 'actions' column empty/NaN but checkpoint is v2."
+                )
+            apath = _abs(str(apath_raw))
+            actions_np = _load_actions_npz(
+                apath, args.num_frames, stats=action_stats, field=args.action_field,
+            )
+            actions_tensor = torch.from_numpy(actions_np).unsqueeze(0).to(
+                device=device, dtype=dtype,
+            )
+            print(f"        actions = {apath}  shape={tuple(actions_tensor.shape)}  "
+                  f"field={args.action_field}  stats={'z-score' if action_stats is not None else 'raw'}")
 
         gen = torch.Generator(device=device).manual_seed(args.seed + idx)
         t0 = time.time()
@@ -415,6 +507,7 @@ def main() -> None:
                 prompt=prompt,
                 negative_prompt="",
                 render_video=render_frames,
+                actions=actions_tensor,
                 num_frames=args.num_frames,
                 height=args.height,
                 width=args.width,
@@ -436,9 +529,30 @@ def main() -> None:
             gt_arr = gt_arr[:T]
             rd_arr = rd_arr[:T]
 
+        # Quality metrics: pred vs GT (real DROID), and pred vs render (DrRobot).
+        # First-frame metrics should be near-perfect (pipeline pins frame 0 to GT);
+        # the trajectory across frames is what shows whether the model is rolling
+        # out the dynamics rather than just regurgitating the start frame.
+        metrics_vs_gt = _per_frame_psnr_ssim(pred_frames, gt_arr)
+        metrics_vs_render = _per_frame_psnr_ssim(pred_frames, rd_arr)
+        print(
+            f"        psnr vs GT: mean={metrics_vs_gt['psnr_mean']:.2f}dB  "
+            f"f0={metrics_vs_gt['psnr_frame0']:.2f}  fT={metrics_vs_gt['psnr_last']:.2f}  "
+            f"| ssim={metrics_vs_gt['ssim_mean']:.4f} (f0={metrics_vs_gt['ssim_frame0']:.4f}, fT={metrics_vs_gt['ssim_last']:.4f})  "
+            f"| mse={metrics_vs_gt['mse_mean']:.5f} (f0={metrics_vs_gt['mse_frame0']:.5f}, fT={metrics_vs_gt['mse_last']:.5f})"
+        )
+        print(
+            f"        psnr vs render: mean={metrics_vs_render['psnr_mean']:.2f}dB  "
+            f"| ssim={metrics_vs_render['ssim_mean']:.4f}  "
+            f"| mse={metrics_vs_render['mse_mean']:.5f}"
+        )
+
         gt_arr   = _label_frames(gt_arr,   "GT (real DROID)")
         rd_arr   = _label_frames(rd_arr,   "render (DrRobot)")
-        pred_arr = _label_frames(pred_frames, "prediction")
+        pred_arr = _label_frames(
+            pred_frames,
+            f"prediction  PSNR={metrics_vs_gt['psnr_mean']:.1f}  SSIM={metrics_vs_gt['ssim_mean']:.3f}  MSE={metrics_vs_gt['mse_mean']:.4f}",
+        )
 
         stack = _hstack_rows(gt_arr, rd_arr, pred_arr)
         out_name = f"eval_idx{idx:03d}_{scene}.mp4"
@@ -457,13 +571,45 @@ def main() -> None:
             "elapsed_s": round(elapsed, 2),
             "out_path": out_path,
             "render_gate": float(pipe.transformer.render_gate.item()) if hasattr(pipe.transformer, "render_gate") else None,
+            "metrics_vs_gt": metrics_vs_gt,
+            "metrics_vs_render": metrics_vs_render,
         })
+
+    # Aggregate metrics across samples.
+    agg = {}
+    if summary and "metrics_vs_gt" in summary[0]:
+        agg = {
+            "psnr_vs_gt_mean":     float(np.mean([s["metrics_vs_gt"]["psnr_mean"] for s in summary])),
+            "ssim_vs_gt_mean":     float(np.mean([s["metrics_vs_gt"]["ssim_mean"] for s in summary])),
+            "mse_vs_gt_mean":      float(np.mean([s["metrics_vs_gt"]["mse_mean"]  for s in summary])),
+            "psnr_vs_render_mean": float(np.mean([s["metrics_vs_render"]["psnr_mean"] for s in summary])),
+            "ssim_vs_render_mean": float(np.mean([s["metrics_vs_render"]["ssim_mean"] for s in summary])),
+            "mse_vs_render_mean":  float(np.mean([s["metrics_vs_render"]["mse_mean"]  for s in summary])),
+            # Per-frame mean across samples — same length T as the predictions.
+            # Useful for plotting "how does MSE/PSNR/SSIM degrade across the rollout?".
+            "psnr_vs_gt_per_frame_mean": np.mean(
+                np.stack([s["metrics_vs_gt"]["psnr_per_frame"] for s in summary]), axis=0
+            ).tolist(),
+            "ssim_vs_gt_per_frame_mean": np.mean(
+                np.stack([s["metrics_vs_gt"]["ssim_per_frame"] for s in summary]), axis=0
+            ).tolist(),
+            "mse_vs_gt_per_frame_mean": np.mean(
+                np.stack([s["metrics_vs_gt"]["mse_per_frame"] for s in summary]), axis=0
+            ).tolist(),
+            "n_samples": len(summary),
+        }
+        print(
+            f"\n[eval] aggregate over {agg['n_samples']} samples: "
+            f"PSNR vs GT={agg['psnr_vs_gt_mean']:.2f}dB  SSIM vs GT={agg['ssim_vs_gt_mean']:.4f}  MSE vs GT={agg['mse_vs_gt_mean']:.5f}  "
+            f"| PSNR vs render={agg['psnr_vs_render_mean']:.2f}dB  SSIM vs render={agg['ssim_vs_render_mean']:.4f}  MSE vs render={agg['mse_vs_render_mean']:.5f}"
+        )
 
     summary_path = os.path.join(args.output_dir, "eval_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump({
             "checkpoint": ckpt_meta,
             "args": vars(args),
+            "aggregate_metrics": agg,
             "samples": summary,
         }, f, indent=2, default=str)
     print(f"\n[eval] wrote summary -> {summary_path}")

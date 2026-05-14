@@ -483,7 +483,7 @@ def parse_args() -> argparse.Namespace:
         "--legacy_render_variant",
         type=str,
         default="egowm",
-        choices=("egowm", "v1", "v2"),
+        choices=("egowm", "v1", "v2", "v3"),
         help="Selects which legacy (non-embodiment-adapter) render-conditioning "
              "design to use:\n"
              "  egowm (default): per-token spatial render encoder added "
@@ -491,10 +491,14 @@ def parse_args() -> argparse.Namespace:
              "EgoWM Eq. 5–6. No actions.\n"
              "  v1 (BACKWARD-COMPAT): pooled-per-frame render encoder + Linear "
              "fuse + scalar render_gate(=0.1). Use to load existing v1 ckpts.\n"
-             "  v2 (NEW, action-conditioned): ActionConditionedTembAdapter — "
-             "render Q ← cross_attn → actions K/V → LayerNorm → zero-init "
-             "Linear → ADD to temb_base. No gates; identity-at-init via "
-             "zero-init out_proj. Requires actions in the dataset/cache.",
+             "  v2 (action-conditioned): ActionConditionedTembAdapter — bare "
+             "cross_attn (no residual, no FFN) → out_proj → ADD to temb_base. "
+             "Ablation baseline that v3 fixes. Requires actions.\n"
+             "  v3 (NEW, action-conditioned): ActionRenderCrossAdapterV3 from "
+             "model_v3.py — 3-layer render encoder + 2-layer action encoder, "
+             "LayerNorm on both, N traditional pre-norm transformer blocks "
+             "(residual cross-attn + residual FFN), 2-layer projection → ADD "
+             "to temb_base. Standard init throughout. Requires actions.",
     )
     p.add_argument(
         "--embodiment_kwargs",
@@ -515,9 +519,42 @@ def parse_args() -> argparse.Namespace:
              "\"spatial_downsample\": 2}). action_dim is required.",
     )
     p.add_argument(
+        "--v3_adapter_kwargs",
+        type=lambda s: json.loads(s) if isinstance(s, str) else s,
+        default=None,
+        help="JSON dict of kwargs forwarded to ActionRenderCrossAdapterV3 "
+             "when --legacy_render_variant=v3 (e.g. "
+             "{\"action_dim\": 8, \"hidden_dim\": 512, \"num_heads\": 8, "
+             "\"num_blocks\": 2, \"spatial_downsample\": 2}). action_dim is required.",
+    )
+    p.add_argument(
         "--ignore_prompts",
         action="store_true",
         help="If set, use empty string for all text prompts during precompute.",
+    )
+    # ---- held-out validation ----
+    p.add_argument(
+        "--val_metadata_csv", type=str, default=None,
+        help="Held-out metadata CSV. If set, runs a no_grad MSE flow-loss pass "
+             "every --val_every_n_epochs and logs val/loss_flow_*.",
+    )
+    p.add_argument(
+        "--val_dataset_base_path", type=str, default=None,
+        help="Base path for paths in --val_metadata_csv. Defaults to --dataset_base_path.",
+    )
+    p.add_argument("--val_every_n_epochs", type=int, default=1)
+    p.add_argument(
+        "--val_n_samples", type=int, default=-1,
+        help="Cap on number of val samples per pass (default -1 = all).",
+    )
+    p.add_argument(
+        "--val_timesteps", type=int, default=4,
+        help="Number of fixed timesteps per val sample (uniformly spaced over the "
+             "scheduler). Deterministic for stable val loss across epochs.",
+    )
+    p.add_argument(
+        "--val_precompute_cache_path", type=str, default=None,
+        help="Optional cache path for the val precompute (separate from --precompute_cache_path).",
     )
     p.set_defaults(**{k: v for k, v in defaults.items() if k != "config"})
     args = p.parse_args(remaining)
@@ -533,31 +570,164 @@ def _load_dit_only(
     embodiment_kwargs: Optional[Dict[str, Any]] = None,
     legacy_render_variant: str = "egowm",
     v2_adapter_kwargs: Optional[Dict[str, Any]] = None,
+    v3_adapter_kwargs: Optional[Dict[str, Any]] = None,
 ) -> WanTransformerRenderConditioned:
     """
     Load *only* the render-conditioned DiT (no VAE / text / image encoders).
     Encoders are run once at startup by ``_precompute_embeddings`` and then
     freed; they are never on the GPU during the FSDP training loop.
+
+    legacy_render_variant="v3" uses the ``WanTransformerRenderConditionedV3``
+    subclass from model_v3.py (separate file, model.py untouched).
     """
     root = model_path.rstrip("/")
     local_transformer = os.path.isdir(os.path.join(root, "transformer"))
-    tkw = dict(
-        torch_dtype=dtype,
-        render_encoder_kwargs={},
-        use_embodiment_adapter=use_embodiment_adapter,
-        embodiment_kwargs=embodiment_kwargs,
-        legacy_render_variant=legacy_render_variant,
-        v2_adapter_kwargs=v2_adapter_kwargs,
-    )
-    if local_transformer:
-        dit = WanTransformerRenderConditioned.from_pretrained(
-            os.path.join(root, "transformer"), **tkw
+    if legacy_render_variant == "v3":
+        from world_model.wan_flow.model_v3 import WanTransformerRenderConditionedV3
+        model_cls = WanTransformerRenderConditionedV3
+        tkw = dict(
+            torch_dtype=dtype,
+            render_encoder_kwargs={},
+            v3_adapter_kwargs=v3_adapter_kwargs,
         )
     else:
-        dit = WanTransformerRenderConditioned.from_pretrained(
-            root, subfolder="transformer", **tkw
+        model_cls = WanTransformerRenderConditioned
+        tkw = dict(
+            torch_dtype=dtype,
+            render_encoder_kwargs={},
+            use_embodiment_adapter=use_embodiment_adapter,
+            embodiment_kwargs=embodiment_kwargs,
+            legacy_render_variant=legacy_render_variant,
+            v2_adapter_kwargs=v2_adapter_kwargs,
         )
+    if local_transformer:
+        dit = model_cls.from_pretrained(os.path.join(root, "transformer"), **tkw)
+    else:
+        dit = model_cls.from_pretrained(root, subfolder="transformer", **tkw)
     return dit
+
+
+@torch.no_grad()
+def _validation_pass(
+    dit,
+    embed_cache_val,
+    scheduler,
+    accelerator,
+    device,
+    dtype: torch.dtype,
+    n_timesteps_per_sample: int,
+    drop_render_conditioning: bool,
+    seed: int,
+    max_samples: int,
+) -> Dict[str, float]:
+    """
+    Held-out validation. Compute MSE flow loss with no_grad over a fixed
+    grid of timesteps per sample (deterministic for stability across epochs).
+    Collective under FSDP — every rank must call this.
+    """
+    import torch.distributed as dist
+
+    was_training = dit.training
+    dit.eval()
+
+    rank = accelerator.process_index
+    world = accelerator.num_processes
+    n = len(embed_cache_val)
+    if max_samples is not None and max_samples > 0:
+        n = min(n, int(max_samples))
+    K = max(1, int(n_timesteps_per_sample))
+
+    n_t = len(scheduler.timesteps)
+    t_indices = [int((k + 0.5) * n_t / K) for k in range(K)]
+    bucket_edges = [n_t * k // 4 for k in range(5)]
+
+    work = [(s, t) for s in range(n) for t in t_indices]
+    pad = (-len(work)) % max(1, world)
+    if pad:
+        work = work + work[:pad]
+    my_work = work[rank::world] if world > 1 else work
+
+    total = 0.0
+    count = 0
+    bucket_sum = [0.0, 0.0, 0.0, 0.0]
+    bucket_cnt = [0, 0, 0, 0]
+
+    for s_idx, t_idx in my_work:
+        cached = embed_cache_val[s_idx]
+        clean_latents = cached["clean_latents"].to(device=device, dtype=dtype, non_blocking=True)
+        prompt_embeds = cached["prompt_embeds"].to(device=device, dtype=dtype, non_blocking=True)
+        image_embeds = cached["image_embeds"].to(device=device, dtype=dtype, non_blocking=True)
+        condition = cached["condition"].to(device=device, dtype=dtype, non_blocking=True)
+        if "render_latents" in cached and not drop_render_conditioning:
+            render_latents = cached["render_latents"].to(device=device, dtype=dtype, non_blocking=True)
+        else:
+            render_latents = None
+        actions = (
+            cached["actions"].to(device=device, dtype=dtype, non_blocking=True).unsqueeze(0)
+            if "actions" in cached else None
+        )
+
+        # Deterministic noise per (sample, timestep) so val loss is stable.
+        gen = torch.Generator(device=clean_latents.device).manual_seed(
+            int(seed) * 1_000_003 + int(s_idx) * 1_009 + int(t_idx)
+        )
+        noise = torch.randn(
+            clean_latents.shape, generator=gen,
+            dtype=clean_latents.dtype, device=clean_latents.device,
+        )
+        timestep_scalar = scheduler.timesteps[t_idx].to(device=device).float()
+        timestep_batch = timestep_scalar.expand(clean_latents.shape[0])
+        noisy_latents = scheduler.scale_noise(clean_latents, timestep_batch, noise)
+        noisy_latents[:, :, 0:1] = clean_latents[:, :, 0:1]
+        latent_in = torch.cat([noisy_latents, condition], dim=1)
+        target = noise - clean_latents
+
+        forward_kwargs = dict(
+            hidden_states=latent_in,
+            timestep=timestep_batch,
+            encoder_hidden_states=prompt_embeds,
+            encoder_hidden_states_image=image_embeds,
+            render_latents=render_latents,
+            return_dict=False,
+        )
+        if actions is not None:
+            forward_kwargs["actions"] = actions
+        pred = dit(**forward_kwargs)[0]
+        loss = F.mse_loss(pred[:, :, 1:].float(), target[:, :, 1:].float())
+        v = float(loss.detach())
+        total += v
+        count += 1
+        b = min(3, max(0, sum(1 for e in bucket_edges[1:] if t_idx >= e)))
+        bucket_sum[b] += v
+        bucket_cnt[b] += 1
+
+    # All-reduce sums + counts across ranks so every rank gets the global means.
+    arr = torch.tensor(
+        [total, count, *bucket_sum, *bucket_cnt],
+        dtype=torch.float64, device=device,
+    )
+    if dist.is_available() and dist.is_initialized() and world > 1:
+        dist.all_reduce(arr, op=dist.ReduceOp.SUM)
+    a = arr.tolist()
+    g_total, g_count = a[0], a[1]
+    g_b_sum = a[2:6]
+    g_b_cnt = a[6:10]
+
+    if was_training:
+        dit.train()
+
+    def _safe_div(num, den):
+        return float(num / den) if den > 0 else float("nan")
+
+    return {
+        "loss_flow_mean": _safe_div(g_total, g_count),
+        "loss_flow_q0": _safe_div(g_b_sum[0], g_b_cnt[0]),
+        "loss_flow_q1": _safe_div(g_b_sum[1], g_b_cnt[1]),
+        "loss_flow_q2": _safe_div(g_b_sum[2], g_b_cnt[2]),
+        "loss_flow_q3": _safe_div(g_b_sum[3], g_b_cnt[3]),
+        "n_evaluations": int(g_count),
+        "n_samples_evaluated": int(g_count // max(1, K)),
+    }
 
 
 def main() -> None:
@@ -698,6 +868,57 @@ def main() -> None:
             f"(latents + prompt + image + condition + tracks)"
         )
 
+    # Optional: precompute held-out val cache the same way (before encoders are
+    # discarded). Sharded across ranks for speed; rebuilt once per run unless
+    # --val_precompute_cache_path is set (then cached on disk like training).
+    embed_cache_val = None
+    if getattr(args, "val_metadata_csv", None):
+        val_base = args.val_dataset_base_path or args.dataset_base_path
+        val_dataset = RenderI2VMetadataDataset(
+            base_path=val_base,
+            metadata_csv=args.val_metadata_csv,
+            num_frames=args.num_frames,
+            height=args.height,
+            width=args.width,
+            repeat=1,
+            action_stats_path=args.action_stats_path,
+            action_field=args.action_field,
+        )
+        if accelerator.is_main_process:
+            try:
+                val_dataset.assert_local_files_exist()
+            except FileNotFoundError as e:
+                raise SystemExit(str(e)) from e
+        accelerator.wait_for_everyone()
+        val_cache_path = (
+            _Path(args.val_precompute_cache_path)
+            if args.val_precompute_cache_path else None
+        )
+        if accelerator.is_main_process:
+            accelerator.print(
+                f"[FSDP val ] sharded precompute of {len(val_dataset.rows)} val "
+                f"samples ..."
+            )
+        embed_cache_val, _, _ = _precompute_embeddings_sharded(
+            accelerator=accelerator,
+            model_path=args.model_path,
+            dataset=val_dataset,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            max_seq_len=args.max_sequence_length,
+            encoder_dtype=encoder_dtype,
+            ignore_prompts=bool(args.ignore_prompts),
+            cache_path=val_cache_path,
+        )
+        _gc.collect()
+        torch.cuda.empty_cache()
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            accelerator.print(
+                f"[FSDP val ] precompute done: {len(embed_cache_val)} val samples"
+            )
+
     # ---------------------------------------------------------------
     # Phase 2: load only the DiT on each rank, FSDP-wrap, train.
     # ---------------------------------------------------------------
@@ -707,6 +928,7 @@ def main() -> None:
         embodiment_kwargs=args.embodiment_kwargs,
         legacy_render_variant=getattr(args, "legacy_render_variant", "egowm"),
         v2_adapter_kwargs=getattr(args, "v2_adapter_kwargs", None),
+        v3_adapter_kwargs=getattr(args, "v3_adapter_kwargs", None),
     )
     n_meta = _materialize_meta_submodules(dit)
     # ``_materialize_meta_submodules`` re-runs ``reset_parameters`` on every
@@ -750,6 +972,11 @@ def main() -> None:
                 # render-conditioner. No render_encoder / render_fuse /
                 # render_gate.
                 for p_ in dit.action_adapter.parameters():
+                    p_.requires_grad = True
+            elif getattr(dit, "legacy_render_variant", "egowm") == "v3":
+                # v3: ActionRenderCrossAdapterV3 is the entire trainable
+                # render-conditioner (model_v3.py). No render_encoder.
+                for p_ in dit.action_adapter_v3.parameters():
                     p_.requires_grad = True
             else:
                 # Legacy egowm / v1: render_encoder is always trainable.
@@ -854,6 +1081,16 @@ def main() -> None:
                     f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
                     f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
                     f"action_adapter={n_aa / 1e6:.2f}M (legacy variant='v2', no gates); "
+                    f"tracks_head={n_th / 1e6:.2f}M  "
+                    f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
+                )
+            elif variant == "v3":
+                n_aa = sum(p.numel() for p in dit.action_adapter_v3.parameters())
+                accelerator.print(
+                    f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
+                    f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
+                    f"action_adapter_v3={n_aa / 1e6:.2f}M (legacy variant='v3', "
+                    f"residual transformer blocks, standard init); "
                     f"tracks_head={n_th / 1e6:.2f}M  "
                     f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
                 )
@@ -1226,6 +1463,9 @@ def main() -> None:
                         elif getattr(inner, "legacy_render_variant", "egowm") == "v2":
                             # v2: only the action_adapter; no render_encoder.
                             groups = [("action_adapter", inner.action_adapter)]
+                        elif getattr(inner, "legacy_render_variant", "egowm") == "v3":
+                            # v3: only the action_adapter_v3; no render_encoder.
+                            groups = [("action_adapter_v3", inner.action_adapter_v3)]
                         else:
                             # egowm: render_encoder only. v1 also adds render_fuse.
                             groups = [("render_encoder", inner.render_encoder)]
@@ -1444,6 +1684,20 @@ def main() -> None:
                                     op = inner_dit.action_adapter.out_proj.weight.detach().float()
                                     log_payload["train/action_adapter_out_proj_norm"] = float(op.norm().item())
                                     log_payload["train/action_adapter_out_proj_max_abs"] = float(op.abs().max().item())
+                                elif lrv_log == "v3":
+                                    # v3 has no gates — track the final temb
+                                    # projection weight + the cross_attn QKV of
+                                    # block 0. Healthy training: the QKV drifts
+                                    # from its init (v2's failure was QKV welded
+                                    # at init). out_proj norm should stay stable
+                                    # (standard init, no rank-1 collapse).
+                                    aa3 = inner_dit.action_adapter_v3
+                                    fp = aa3.to_temb[-1].weight.detach().float()
+                                    qkv = aa3.blocks[0].cross_attn.in_proj_weight.detach().float()
+                                    log_payload["train/v3_to_temb_norm"] = float(fp.norm().item())
+                                    log_payload["train/v3_to_temb_max_abs"] = float(fp.abs().max().item())
+                                    log_payload["train/v3_block0_qkv_norm"] = float(qkv.norm().item())
+                                    log_payload["train/v3_block0_qkv_std"] = float(qkv.std().item())
                             # Per-quartile (by timestep) running-average flow loss.
                             # The "mid" buckets (Q1, Q2) are the hardest and are
                             # the best signal of actual learning progress.
@@ -1474,6 +1728,46 @@ def main() -> None:
                     "train/loss_flow_epoch_mean": epoch_mean,
                     "train/epoch_done": abs_e,
                 }, step=global_step)
+
+        # ---- held-out validation pass ----
+        # Collective under FSDP; every rank participates. Triggered every
+        # --val_every_n_epochs and at the final epoch.
+        if (
+            embed_cache_val is not None
+            and (
+                (epoch + 1) % max(1, int(args.val_every_n_epochs)) == 0
+                or epoch == args.num_epochs - 1
+            )
+        ):
+            val_stats = _validation_pass(
+                dit=dit,
+                embed_cache_val=embed_cache_val,
+                scheduler=scheduler,
+                accelerator=accelerator,
+                device=device,
+                dtype=dtype,
+                n_timesteps_per_sample=int(args.val_timesteps),
+                drop_render_conditioning=bool(args.drop_render_conditioning),
+                seed=int(args.seed) + abs_e * 7919,
+                max_samples=int(args.val_n_samples),
+            )
+            if accelerator.is_main_process:
+                accelerator.print(
+                    f"[val   {abs_e}] loss_flow_mean = {val_stats['loss_flow_mean']:.4f}  "
+                    f"q0={val_stats['loss_flow_q0']:.4f}  q1={val_stats['loss_flow_q1']:.4f}  "
+                    f"q2={val_stats['loss_flow_q2']:.4f}  q3={val_stats['loss_flow_q3']:.4f}  "
+                    f"({val_stats['n_samples_evaluated']} samples × {args.val_timesteps} timesteps)"
+                )
+                if use_wandb:
+                    import wandb
+                    wandb.log({
+                        "val/loss_flow_mean": val_stats["loss_flow_mean"],
+                        "val/loss_flow_q0": val_stats["loss_flow_q0"],
+                        "val/loss_flow_q1": val_stats["loss_flow_q1"],
+                        "val/loss_flow_q2": val_stats["loss_flow_q2"],
+                        "val/loss_flow_q3": val_stats["loss_flow_q3"],
+                        "val/epoch": abs_e,
+                    }, step=global_step)
 
         should_save = (
             (epoch + 1) % args.save_every_n_epochs == 0
@@ -1539,6 +1833,11 @@ def main() -> None:
                         # `action_adapter.*`. No render_encoder / render_fuse /
                         # render_gate in this path.
                         keep_prefixes = ["action_adapter."]
+                        keep_exact = set()
+                    elif getattr(args, "legacy_render_variant", "egowm") == "v3":
+                        # v3: ActionRenderCrossAdapterV3 lives at
+                        # `action_adapter_v3.*` (model_v3.py).
+                        keep_prefixes = ["action_adapter_v3."]
                         keep_exact = set()
                     else:
                         keep_prefixes = ["render_encoder.", "render_fuse."]

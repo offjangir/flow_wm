@@ -1,22 +1,22 @@
 {
-  "_comment_target": "Action-conditioned legacy variant v2 (ActionConditionedTembAdapter) on the full 802-clip droid_1k train split, FSDP. v2 = render Q ← cross_attn → 8-d (joint+gripper) actions K/V → LayerNorm → zero-init Linear → ADD to temb_base → time_proj. Identity-at-init via zero-init out_proj weight+bias; LayerNorm-before-proj guarantees ∂L/∂out_proj.weight ≠ 0 from step 1 (no dual-zero deadlock, no gate needed). 30 epochs targeted. The legacy egowm 30-epoch run (run_20260507_052841) is the baseline this should beat.",
+  "_comment_target": "Action-conditioned legacy variant v2 (ActionConditionedTembAdapter) on the full 802-clip droid_1k train split, FSDP. v2 = render Q ← cross_attn → 8-d (joint+gripper) actions K/V → LayerNorm → out_proj (kaiming-init, NOT zero) → ADD to temb_base → time_proj. NO zero-init / NO gates: mirrors egowm init philosophy. Earlier zero-init out_proj caused a rank-1 collapse (cross_attn.in_proj_weight welded at xavier, contribution carrying only a constant dataset-mean offset — see memory:project_v2_adapter_collapse). 17 frames @ 240×432 for a fast A/B against the egowm 30-epoch baseline (run_20260507_052841) at matched resolution + length.",
 
   "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
   "dataset_base_path": "data_wan_1k",
-  "_metadata_note": "Filtered version of train_metadata_train.csv (802 rows) → 795 rows after dropping 7 clips with fewer than 82 mp4 frames (which the num_frames=81 loader rejects). The dropped scenes: 386, 90, 498, 615, 331, 373, 444.",
-  "metadata_csv": "data_wan_1k/train_metadata_train_81f.csv",
+  "_metadata_note": "Full 802-row train split — matches the egowm baseline's metadata exactly. 17-frame loader needs only ≥18 mp4 frames, so the 81-frame filtering is unnecessary here.",
+  "metadata_csv": "data_wan_1k/train_metadata_train.csv",
   "output_dir": "./checkpoints/wan_render_drrobot_1k_legacy_8xl40_action_aware_v2",
 
-  "_num_frames_note": "81 = Wan 2.1 I2V's max-supported temporal length. T_lat=21 latent frames, num_tokens=8505. Self-attn O(N²) is ~17.6× more expensive per step vs 17 frames, but FFN dominates DiT compute and scales linearly → wall-clock per-step is only ~1.4× slower (verified: 25s→35s on 6×A100). Full 30-epoch run estimate: ~39 hr. The dataset filter requires every video to have ≥82 mp4 frames; the 802-row train split needs auditing for short clips before launch (smallest in 10-vid subset was 83, just barely sufficient).",
-  "num_frames": 81,
+  "_num_frames_note": "17 = matches egowm baseline. T_lat=5 post-patch frames × 30×54 spatial = 8100 tokens. ~4× faster per step than 81 frames; loss/PSNR comparable to egowm in this regime so the action-conditioning contribution is the variable we're measuring.",
+  "num_frames": 17,
   "height": 240,
   "width": 432,
 
   "action_stats_path": "data_wan_1k/action_stats.json",
   "action_field": "state",
 
-  "_cache_note": "81-frame cache; will MISS and rebuild from scratch (~30 min for 802 videos through the VAE on a single GPU). Cache file size ~30-40 GB on disk.",
-  "precompute_cache_path": "data_wan_1k/precompute_cache_81f_v2.pt",
+  "_cache_note": "v2 17-frame cache. Cache key includes has_actions=True + action_field=state, so it is distinct from the egowm 17-frame cache at precompute_cache_17f.pt — they will NOT collide. First launch MISSES; subsequent launches HIT.",
+  "precompute_cache_path": "data_wan_1k/precompute_cache_17f_v2.pt",
 
   "dataset_repeat": 1,
   "num_epochs": 30,
@@ -59,7 +59,14 @@
     "spatial_downsample": 2
   },
 
+  "_val_note": "Held-out 10-scene set at data_wan_eval/eval_metadata.csv (scenes 10000-10009 — never seen during training on data_wan_1k). Runs every 2 epochs at 4 fixed timesteps per sample, deterministic noise → stable val curve.",
+  "val_metadata_csv": "data_wan_eval/eval_metadata.csv",
+  "val_dataset_base_path": "data_wan_eval",
+  "val_every_n_epochs": 2,
+  "val_timesteps": 4,
+  "val_precompute_cache_path": "data_wan_eval/precompute_cache_val_17f_v2.pt",
+
   "wandb_project": "wan_flow_drrobot",
-  "wandb_run_name": "1k_legacy_8xl40_action_aware_v2",
+  "wandb_run_name": "1k_legacy_8xl40_action_aware_v2_no_zero_init",
   "wandb_mode": "online"
 }

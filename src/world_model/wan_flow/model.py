@@ -533,9 +533,6 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                         self.render_fuse.bias.zero_()
                 elif lrv == "v2":
                     aa = self.action_adapter
-                    nn.init.zeros_(aa.out_proj.weight)
-                    if aa.out_proj.bias is not None:
-                        nn.init.zeros_(aa.out_proj.bias)
                     # MultiheadAttention.in_proj_weight is silently zero-init'd
                     # by diffusers' `_init_weights` for any module not present
                     # in the loaded HF checkpoint, even though MHA's own
@@ -925,6 +922,7 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
         render_video: Optional[Any] = None,
         render_latents: Optional[torch.Tensor] = None,
         drop_render_conditioning: bool = False,
+        actions: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "np",
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -1123,6 +1121,7 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
                     encoder_hidden_states=prompt_embeds,
                     encoder_hidden_states_image=image_embeds,
                     render_latents=render_latents,
+                    actions=actions,
                     query_xy=query_xy if (query_xy is not None and i == len(timesteps) - 1) else None,
                     track_T=track_T,
                     attention_kwargs=attention_kwargs,
@@ -1141,6 +1140,7 @@ class RenderConditionedWanI2VPipeline(WanImageToVideoPipeline):
                         encoder_hidden_states=negative_prompt_embeds,
                         encoder_hidden_states_image=image_embeds,
                         render_latents=render_latents,
+                        actions=actions,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                     )[0]
