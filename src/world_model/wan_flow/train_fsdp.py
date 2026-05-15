@@ -57,6 +57,7 @@ from world_model.wan_flow.train import (
     condition_usage_sanity,
     fsdp_micro_steps_per_epoch,
     optimizer_step_count,
+    resolve_wan_model_root,
     save_forward_debug_bundle,
 )
 
@@ -580,7 +581,7 @@ def _load_dit_only(
     legacy_render_variant="v3" uses the ``WanTransformerRenderConditionedV3``
     subclass from model_v3.py (separate file, model.py untouched).
     """
-    root = model_path.rstrip("/")
+    root = resolve_wan_model_root(model_path)
     local_transformer = os.path.isdir(os.path.join(root, "transformer"))
     if legacy_render_variant == "v3":
         from world_model.wan_flow.model_v3 import WanTransformerRenderConditionedV3
@@ -1415,7 +1416,7 @@ def main() -> None:
                     )
                     forward_debug_done = True
                 if pred_tracks is not None:
-                    diff = F.smooth_l1_loss(
+                    diff = F.mse_loss(
                         pred_tracks.float(), gt_xy.float(), reduction="none"
                     ).sum(-1)
                     vis_sum = gt_vis.sum().clamp(min=1.0)

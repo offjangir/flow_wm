@@ -59,6 +59,7 @@ Usage (from ``wm/`` root, in the ``dr`` conda env)::
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 from typing import List
 
@@ -157,8 +158,10 @@ def _process_scene_dense(
     frames, fps, vidW, vidH = _read_video_frames(clip_path)
 
     z = np.load(dense_npz_path)
-    flow = z["flow"]                  # (T, H, W, 2) float16
-    visibs = z["visibs"]              # (T, H, W)    bool
+    # Two saved key conventions: older data_wan dense npzs use flow/visibs;
+    # data_wan_1k dense npzs use flow_thw2/visibs_thw.
+    flow = z["flow"] if "flow" in z.files else z["flow_thw2"]      # (T, H, W, 2) float16
+    visibs = z["visibs"] if "visibs" in z.files else z["visibs_thw"]  # (T, H, W) bool
     atH, atW = (int(x) for x in z["image_size"])
 
     sx, sy = vidW / float(atW), vidH / float(atH)
@@ -364,6 +367,10 @@ def main() -> None:
         sorted(args.dense_tracks_dir.glob("*.npz"))
         if args.dense_tracks_dir.is_dir() else []
     )
+    # Skip resolution-suffixed variants (e.g. scene_X_240x432.npz): dense
+    # files are matched to <scene>.mp4 by stem, so a suffixed stem never
+    # resolves to a source video.
+    dense_npzs = [p for p in dense_npzs if not re.search(r"_\d+x\d+$", p.stem)]
     sparse_by_scene = {p.stem: p for p in sparse_npzs}
     dense_by_scene = {p.stem: p for p in dense_npzs}
 

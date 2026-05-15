@@ -800,6 +800,32 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def resolve_wan_model_root(model_path: str) -> str:
+    """Resolve ``model_path`` to a local directory.
+
+    If it is already a local dir, return it. If it is a HuggingFace repo id
+    (e.g. "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"), resolve it to the local
+    snapshot dir in the HF cache so downstream ``from_pretrained`` calls get a
+    local path and never hit the network — the compute nodes are offline, and
+    diffusers' ``_get_checkpoint_shard_files`` otherwise issues a ``model_info``
+    API call that fails (``HF_HUB_OFFLINE`` does not skip it, only makes it
+    raise). Files must already be in the HF cache. Falls back to the original
+    string on failure.
+    """
+    root = str(model_path).rstrip("/")
+    if os.path.isdir(root):
+        return root
+    try:
+        from huggingface_hub import snapshot_download
+        local = snapshot_download(root, local_files_only=True)
+        print(f"[resolve] HF repo id → local snapshot: {local}")
+        return local
+    except Exception as exc:  # noqa: BLE001
+        print(f"[resolve] WARN: could not resolve {root!r} to a local snapshot "
+              f"({exc}); falling back to repo id (will hit the network)")
+        return root
+
+
 _PRECOMPUTE_CACHE_VERSION = 2
 
 
@@ -1655,7 +1681,7 @@ def main() -> None:
                     )
                     forward_debug_done = True
                 if pred_tracks is not None:
-                    diff = F.smooth_l1_loss(
+                    diff = F.mse_loss(
                         pred_tracks.float(), gt_xy.float(), reduction="none"
                     ).sum(-1)                              # (1, T, N)
                     vis_sum = gt_vis.sum().clamp(min=1.0)

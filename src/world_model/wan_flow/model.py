@@ -198,8 +198,14 @@ class TracksHead(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 2),
         )
-        # Zero-init final layer for "no motion" prior at step 0.
-        nn.init.zeros_(self.mlp[-1].weight)
+        # Small Kaiming He init on final layer. Zero-init was too weak (no
+        # tracks-gradient to penultimate features at step 0); pure Kaiming
+        # would give initial pred std ~1.4 -> initial MSE ~2 -> dominates the
+        # flow loss when paired with lambda_tracks=50. The 0.1 scale keeps
+        # initial pred std ~0.14 -> initial MSE ~0.02 -> contribution ~1.0,
+        # comparable to flow.
+        nn.init.kaiming_normal_(self.mlp[-1].weight, nonlinearity="relu")
+        self.mlp[-1].weight.data.mul_(0.1)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, token_grid, query_xy, T_video=None, chunk_size: int = 16384):
@@ -541,8 +547,9 @@ class WanTransformerRenderConditioned(WanTransformer3DModel):
                     nn.init.xavier_uniform_(aa.cross_attn.in_proj_weight)
                     if aa.cross_attn.in_proj_bias is not None:
                         nn.init.zeros_(aa.cross_attn.in_proj_bias)
-            # Tracks head's final layer is zero-init for "no motion at step 0".
-            nn.init.zeros_(self.tracks_head.mlp[-1].weight)
+            # Tracks head's final layer: small Kaiming He init (see TracksHead.__init__).
+            nn.init.kaiming_normal_(self.tracks_head.mlp[-1].weight, nonlinearity="relu")
+            self.tracks_head.mlp[-1].weight.data.mul_(0.1)
             nn.init.zeros_(self.tracks_head.mlp[-1].bias)
 
     def forward(
