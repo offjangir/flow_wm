@@ -80,7 +80,7 @@ TASK_CATEGORIES: Dict[str, List[str]] = {
                      "and then", "after"],
 }
 
-MAX_PER_SESSION = 5     # max episodes from same (lab, recording date)
+MAX_PER_SESSION = 300   # was 5; loosened aggressively to scale to 10k episodes (less diverse per-session but unblocks total N; multi_step category capped at 37 by DROID itself)
 DEFAULT_WORKERS = 64    # threads for HEAD validation + download
 
 # ─── UUID -> bucket path ──────────────────────────────────────────────────────
