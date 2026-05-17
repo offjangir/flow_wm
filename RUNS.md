@@ -120,25 +120,148 @@ v3 needs the action stream: `--action_stats_path data_wan_1k/action_stats.json
 accept and forward `actions` (`--action_stats_path`, `--action_field` exist),
 but the transformer-class selection is not wired.
 
-**To eval this run:** add a `--legacy_render_variant` (or `--v3`) flag to
-`eval_world_model.py` so `_build_pipeline` builds
-`WanTransformerRenderConditionedV3` with `v3_adapter_kwargs`. Then the eval
-command mirrors egowm's, plus:
+**To eval this run** (now wired — `eval_world_model.py` accepts
+`--legacy_render_variant {v3,v4}` plus `--v{3,4}_adapter_kwargs`):
 
 ```bash
     --action_stats_path data_wan_1k/action_stats.json \
     --action_field state \
     --legacy_render_variant v3 \
+    --v3_adapter_kwargs '{"action_dim": 8, "hidden_dim": 512, "num_heads": 8, "num_blocks": 2, "spatial_downsample": 2}'
 ```
+
+---
+
+## 4. v4 — render self-attn + cross-attn (targets render-encoder collapse)
+
+`legacy_render_variant: "v4"` — `ActionRenderSelfCrossAdapterV4`
+(`src/world_model/wan_flow/embodiment_adapter_v3.py`) wrapped by
+`WanTransformerRenderConditionedV4`
+(`src/world_model/wan_flow/model_v4.py`, subclass — `model.py` and
+`model_v3.py` untouched).
+
+Built on top of v3 (Pathway A) with three architectural additions
+targeting the universal-bias collapse mode diagnosed by
+`scripts/diagnose_egowm_collapse.py` (legacy egowm: `R_ratio = 6.3`,
+`contrib_cos = 0.96` — encoder emits a near-constant direction across
+scenes):
+
+1. **Pre-encoder mean subtraction on VAE latents** (per channel,
+   spatial-temporal). For DrRobot renders (~95% black canvas), the
+   spatial mean approximates `f_VAE(empty canvas)`; subtracting leaves
+   only the per-scene arm-pose deviation as input to the conv encoder.
+2. **Temporal mixing in the middle conv** (`(1,3,3)` → `(3,3,3)` kernel
+   with manual replicate-pad in the temporal dim) so boundary frames
+   don't see zero-padding.
+3. **Self-attention transformer blocks** on per-token features, BEFORE
+   the cross-attn with actions. 3D positional encoding is added on
+   render tokens, 1D positional encoding on action tokens, so attention
+   can reason about spatial/temporal alignment instead of treating
+   tokens as unordered sets.
+
+Validated by `scripts/diagnose_v4_collapse.py` on `epoch_9` of the
+17-frame full run: `R_ratio = 2.67` (vs egowm's 6.3, v2's 15),
+`contrib_cos = 0.87` (vs egowm 0.96), `to_temb` effective rank 1677/2048
+(no architectural rank collapse). Action-shuffle delta `0.49` and
+render-shuffle delta `0.07` confirm actions are the dominant
+conditioning signal at this scale.
+
+| | |
+|---|---|
+| Run dir | `checkpoints/wan_render_drrobot_1k_v4_full_17f_4xH100NVL_n06/` |
+| Full config | `configs/train_drrobot_1k_v4_full_17f.json` (802 clips × 100 epochs, accum=2, lambda_tracks=50, max_query_points=640) |
+| Smoke config | `configs/train_drrobot_1k_v4_smoke.json` (10 vids × 5 epochs, plumbing validation) |
+| wandb run | `1k_v4_full_17f_accum2_4xH100NVL_n06` |
+| trainable | `render_only` + `unfreeze_last_n_blocks: 8` |
+| Checkpoints | `epoch_{9,19,29,...}/render_conditioner.pt` — saves the `action_adapter_v4.*` subset + unfrozen DiT blocks + tracks_head |
+| Params | adapter ≈ 30 M (vs v3's ~9 M) |
+
+v4 needs the action stream just like v3: `action_stats_path`,
+`action_field: state` (8-d joint+gripper), and the metadata CSV must
+have an `actions` column. **Important:** the original v4 config draft
+did not set `action_stats_path` (caught after the first launch was 14
+epochs deep with raw actions) — the committed config sets it so any
+restart / new run gets proper z-score normalization. See
+[`feedback_action_stats_path`](../memory/feedback_action_stats_path.md).
+
+### Launch (single 4-GPU node, FSDP)
+
+```bash
+# from repo root, in `dr` conda env
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTHONPATH=src PYTHONUNBUFFERED=1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+HF_HOME=/path/to/huggingface \
+nohup conda run -n dr accelerate launch \
+  --num_processes 4 \
+  --config_file configs/accelerate_fsdp.yaml \
+  -m world_model.wan_flow.train_fsdp \
+  --config configs/train_drrobot_1k_v4_full_17f.json \
+  > logs/v4_full_17f_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+Always pass `--config_file configs/accelerate_fsdp.yaml` — otherwise
+accelerate silently falls back to DDP and only the `[FSDP train]`
+log labels are correct, not the strategy
+(see [`feedback_fsdp_config_file`](../memory/feedback_fsdp_config_file.md)).
+
+### Smoke test (recommended before the full run)
+
+```bash
+accelerate launch --config_file configs/accelerate_fsdp.yaml \
+  --num_processes 4 \
+  -m world_model.wan_flow.train_fsdp \
+  --config configs/train_drrobot_1k_v4_smoke.json
+```
+
+10 videos × 5 epochs (~10 min). Validates the v4 plumbing end-to-end:
+adapter loads cleanly, FSDP shards correctly, forward + backward
+complete, val computes, tracks loss contributes, checkpoint saves with
+the `action_adapter_v4.` prefix.
+
+### Eval (the same script supports v4 via `--legacy_render_variant v4`)
+
+```bash
+python scripts/eval_world_model.py \
+  --model_path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
+  --ckpt checkpoints/wan_render_drrobot_1k_v4_full_17f_*/run_*/epoch_9/render_conditioner.pt \
+  --eval_csv data_wan_eval/eval_metadata.csv \
+  --action_stats_path data_wan_1k/action_stats.json \
+  --action_field state \
+  --legacy_render_variant v4 \
+  --v4_adapter_kwargs '{"action_dim": 8, "hidden_dim": 512, "num_heads": 8, "num_self_blocks": 2, "num_cross_blocks": 2, "spatial_downsample": 2, "max_action_frames": 128, "max_t": 32, "max_h": 32, "max_w": 64}'
+```
+
+The `v4_adapter_kwargs` MUST match the values used at training
+(see the training config's `v4_adapter_kwargs` block).
+
+### Diagnostic probe (collapse analysis)
+
+```bash
+PYTHONPATH=src python scripts/diagnose_v4_collapse.py \
+  --ckpt checkpoints/wan_render_drrobot_1k_v4_full_17f_*/run_*/epoch_9/render_conditioner.pt \
+  --eval-csv data_wan_1k/train_metadata_test.csv \
+  --cache-path data_wan_1k/precompute_cache_probe_v4_16scenes_17f.pt \
+  --n-scenes 16 \
+  --out-dir diagnostics/v4_epoch9 \
+  --device cuda:0 --dtype bf16
+```
+
+**Always use a probe-suffixed cache path** — the precompute helper
+overwrites the cache file if the scene set differs from training's,
+which silently clobbers the multi-GB train cache
+(see [`feedback_probe_cache_clobber`](../memory/feedback_probe_cache_clobber.md)).
+
+Writes `diagnostics/v4_epoch9/{metrics.json, diag.png, raw.npz}` with
+the same metric names as `diagnose_egowm_collapse.py` and
+`diagnose_v2_collapse.py` for direct cross-architecture comparison.
 
 ---
 
 ## Known eval-tooling gaps (TODO)
 
-`eval_world_model.py` currently only fully supports `egowm` / `v1` / `v2`
-(render-only) checkpoints. To close the loop on runs 2 and 3:
+`eval_world_model.py` now supports `egowm` / `v1` / `v2` / `v3` / `v4`
+checkpoints via `--legacy_render_variant`. Remaining gaps:
 
 1. `--transformer_path` override — load a fine-tuned full transformer dir
    (unblocks full_dit / nordr eval).
-2. v3 transformer-class selection in `_build_pipeline` — build
-   `WanTransformerRenderConditionedV3` when evaluating a v3 checkpoint.
