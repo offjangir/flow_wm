@@ -127,6 +127,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--action_field", type=str, default="state",
                    help="Field name in actions/<scene>.npz. 'state' = 8-d joint+gripper "
                         "(default); 'action' = 7-d commanded target+gripper.")
+    p.add_argument("--legacy_render_variant", type=str, default="egowm",
+                   choices=("egowm", "v1", "v2", "v3", "v4"),
+                   help="Selects the transformer subclass. v3/v4 require their "
+                        "respective adapter_kwargs JSON to match training.")
+    p.add_argument("--v3_adapter_kwargs", type=json.loads, default=None,
+                   help="JSON dict of v3 adapter kwargs (must match training args.json).")
+    p.add_argument("--v4_adapter_kwargs", type=json.loads, default=None,
+                   help="JSON dict of v4 adapter kwargs (must match training args.json).")
     return p.parse_args()
 
 
@@ -270,16 +278,26 @@ def _label_frames(frames: np.ndarray, label: str, band_h: int = 24) -> np.ndarra
 def _build_pipeline(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> RenderConditionedWanI2VPipeline:
     root = args.model_path.rstrip("/")
     local_transformer = os.path.isdir(os.path.join(root, "transformer"))
-    print(f"[eval] loading transformer (render-conditioned) from {root} ...")
+    variant = getattr(args, "legacy_render_variant", "egowm")
+    print(f"[eval] loading transformer (render-conditioned, variant={variant}) from {root} ...")
     tkw = dict(torch_dtype=dtype, render_encoder_kwargs={})
-    if local_transformer:
-        transformer = WanTransformerRenderConditioned.from_pretrained(
-            os.path.join(root, "transformer"), **tkw
-        )
+    if variant == "v3":
+        from world_model.wan_flow.model_v3 import WanTransformerRenderConditionedV3
+        model_cls = WanTransformerRenderConditionedV3
+        if getattr(args, "v3_adapter_kwargs", None) is not None:
+            tkw["v3_adapter_kwargs"] = args.v3_adapter_kwargs
+    elif variant == "v4":
+        from world_model.wan_flow.model_v4 import WanTransformerRenderConditionedV4
+        model_cls = WanTransformerRenderConditionedV4
+        if getattr(args, "v4_adapter_kwargs", None) is not None:
+            tkw["v4_adapter_kwargs"] = args.v4_adapter_kwargs
     else:
-        transformer = WanTransformerRenderConditioned.from_pretrained(
-            root, subfolder="transformer", **tkw
-        )
+        model_cls = WanTransformerRenderConditioned
+        tkw["legacy_render_variant"] = variant
+    if local_transformer:
+        transformer = model_cls.from_pretrained(os.path.join(root, "transformer"), **tkw)
+    else:
+        transformer = model_cls.from_pretrained(root, subfolder="transformer", **tkw)
     # `from_pretrained` leaves newly-added modules (render_encoder, render_fuse,
     # render_gate, tracks_head) on the meta device because they don't exist
     # in the pretrained Wan I2V safetensors. Materialize them on CPU before the

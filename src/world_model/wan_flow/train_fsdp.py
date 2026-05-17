@@ -484,7 +484,7 @@ def parse_args() -> argparse.Namespace:
         "--legacy_render_variant",
         type=str,
         default="egowm",
-        choices=("egowm", "v1", "v2", "v3"),
+        choices=("egowm", "v1", "v2", "v3", "v4"),
         help="Selects which legacy (non-embodiment-adapter) render-conditioning "
              "design to use:\n"
              "  egowm (default): per-token spatial render encoder added "
@@ -495,11 +495,18 @@ def parse_args() -> argparse.Namespace:
              "  v2 (action-conditioned): ActionConditionedTembAdapter — bare "
              "cross_attn (no residual, no FFN) → out_proj → ADD to temb_base. "
              "Ablation baseline that v3 fixes. Requires actions.\n"
-             "  v3 (NEW, action-conditioned): ActionRenderCrossAdapterV3 from "
+             "  v3 (action-conditioned): ActionRenderCrossAdapterV3 from "
              "model_v3.py — 3-layer render encoder + 2-layer action encoder, "
-             "LayerNorm on both, N traditional pre-norm transformer blocks "
-             "(residual cross-attn + residual FFN), 2-layer projection → ADD "
-             "to temb_base. Standard init throughout. Requires actions.",
+             "N traditional pre-norm transformer blocks (residual cross-attn "
+             "+ residual FFN), 2-layer projection → ADD to temb_base. "
+             "Standard init throughout. Requires actions.\n"
+             "  v4 (NEW, action-conditioned): ActionRenderSelfCrossAdapterV4 "
+             "from model_v4.py — v3 plus pre-encoder mean-subtract on VAE "
+             "latents, temporal mixing + replicate-padding in the middle "
+             "conv, 3D positional encoding on render tokens, 1D positional "
+             "encoding on action tokens, N self-attention transformer blocks "
+             "BEFORE the cross-attention blocks. Targets the render-encoder "
+             "failure modes diagnosed by diagnose_egowm_collapse.py.",
     )
     p.add_argument(
         "--embodiment_kwargs",
@@ -527,6 +534,17 @@ def parse_args() -> argparse.Namespace:
              "when --legacy_render_variant=v3 (e.g. "
              "{\"action_dim\": 8, \"hidden_dim\": 512, \"num_heads\": 8, "
              "\"num_blocks\": 2, \"spatial_downsample\": 2}). action_dim is required.",
+    )
+    p.add_argument(
+        "--v4_adapter_kwargs",
+        type=lambda s: json.loads(s) if isinstance(s, str) else s,
+        default=None,
+        help="JSON dict of kwargs forwarded to ActionRenderSelfCrossAdapterV4 "
+             "when --legacy_render_variant=v4 (e.g. "
+             "{\"action_dim\": 8, \"hidden_dim\": 512, \"num_heads\": 8, "
+             "\"num_self_blocks\": 2, \"num_cross_blocks\": 2, "
+             "\"spatial_downsample\": 2, \"max_action_frames\": 128, "
+             "\"max_t\": 32, \"max_h\": 32, \"max_w\": 64}). action_dim is required.",
     )
     p.add_argument(
         "--ignore_prompts",
@@ -572,6 +590,7 @@ def _load_dit_only(
     legacy_render_variant: str = "egowm",
     v2_adapter_kwargs: Optional[Dict[str, Any]] = None,
     v3_adapter_kwargs: Optional[Dict[str, Any]] = None,
+    v4_adapter_kwargs: Optional[Dict[str, Any]] = None,
 ) -> WanTransformerRenderConditioned:
     """
     Load *only* the render-conditioned DiT (no VAE / text / image encoders).
@@ -579,7 +598,8 @@ def _load_dit_only(
     freed; they are never on the GPU during the FSDP training loop.
 
     legacy_render_variant="v3" uses the ``WanTransformerRenderConditionedV3``
-    subclass from model_v3.py (separate file, model.py untouched).
+    subclass from model_v3.py; "v4" uses the V4 subclass from model_v4.py
+    (both separate files, model.py untouched).
     """
     root = resolve_wan_model_root(model_path)
     local_transformer = os.path.isdir(os.path.join(root, "transformer"))
@@ -590,6 +610,14 @@ def _load_dit_only(
             torch_dtype=dtype,
             render_encoder_kwargs={},
             v3_adapter_kwargs=v3_adapter_kwargs,
+        )
+    elif legacy_render_variant == "v4":
+        from world_model.wan_flow.model_v4 import WanTransformerRenderConditionedV4
+        model_cls = WanTransformerRenderConditionedV4
+        tkw = dict(
+            torch_dtype=dtype,
+            render_encoder_kwargs={},
+            v4_adapter_kwargs=v4_adapter_kwargs,
         )
     else:
         model_cls = WanTransformerRenderConditioned
@@ -930,6 +958,7 @@ def main() -> None:
         legacy_render_variant=getattr(args, "legacy_render_variant", "egowm"),
         v2_adapter_kwargs=getattr(args, "v2_adapter_kwargs", None),
         v3_adapter_kwargs=getattr(args, "v3_adapter_kwargs", None),
+        v4_adapter_kwargs=getattr(args, "v4_adapter_kwargs", None),
     )
     n_meta = _materialize_meta_submodules(dit)
     # ``_materialize_meta_submodules`` re-runs ``reset_parameters`` on every
@@ -978,6 +1007,11 @@ def main() -> None:
                 # v3: ActionRenderCrossAdapterV3 is the entire trainable
                 # render-conditioner (model_v3.py). No render_encoder.
                 for p_ in dit.action_adapter_v3.parameters():
+                    p_.requires_grad = True
+            elif getattr(dit, "legacy_render_variant", "egowm") == "v4":
+                # v4: ActionRenderSelfCrossAdapterV4 is the entire trainable
+                # render-conditioner (model_v4.py). No render_encoder.
+                for p_ in dit.action_adapter_v4.parameters():
                     p_.requires_grad = True
             else:
                 # Legacy egowm / v1: render_encoder is always trainable.
@@ -1092,6 +1126,17 @@ def main() -> None:
                     f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
                     f"action_adapter_v3={n_aa / 1e6:.2f}M (legacy variant='v3', "
                     f"residual transformer blocks, standard init); "
+                    f"tracks_head={n_th / 1e6:.2f}M  "
+                    f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
+                )
+            elif variant == "v4":
+                n_aa = sum(p.numel() for p in dit.action_adapter_v4.parameters())
+                accelerator.print(
+                    f"[FSDP train] DiT params: {n_total / 1e9:.2f}B total, "
+                    f"{n_trainable / 1e6:.1f}M trainable ({100 * n_trainable / n_total:.2f}%); "
+                    f"action_adapter_v4={n_aa / 1e6:.2f}M (legacy variant='v4', "
+                    f"VAE-mean-subtract + temporal-mix conv + self-attn × N + "
+                    f"cross-attn × N + 3D/1D pos encodings); "
                     f"tracks_head={n_th / 1e6:.2f}M  "
                     f"lambda_tracks={args.lambda_tracks}  use_tracks_loss={use_tracks_loss}"
                 )
@@ -1467,6 +1512,9 @@ def main() -> None:
                         elif getattr(inner, "legacy_render_variant", "egowm") == "v3":
                             # v3: only the action_adapter_v3; no render_encoder.
                             groups = [("action_adapter_v3", inner.action_adapter_v3)]
+                        elif getattr(inner, "legacy_render_variant", "egowm") == "v4":
+                            # v4: only the action_adapter_v4; no render_encoder.
+                            groups = [("action_adapter_v4", inner.action_adapter_v4)]
                         else:
                             # egowm: render_encoder only. v1 also adds render_fuse.
                             groups = [("render_encoder", inner.render_encoder)]
@@ -1839,6 +1887,11 @@ def main() -> None:
                         # v3: ActionRenderCrossAdapterV3 lives at
                         # `action_adapter_v3.*` (model_v3.py).
                         keep_prefixes = ["action_adapter_v3."]
+                        keep_exact = set()
+                    elif getattr(args, "legacy_render_variant", "egowm") == "v4":
+                        # v4: ActionRenderSelfCrossAdapterV4 lives at
+                        # `action_adapter_v4.*` (model_v4.py).
+                        keep_prefixes = ["action_adapter_v4."]
                         keep_exact = set()
                     else:
                         keep_prefixes = ["render_encoder.", "render_fuse."]

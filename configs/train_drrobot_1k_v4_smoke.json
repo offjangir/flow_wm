@@ -1,0 +1,76 @@
+{
+  "_comment_target": "v4 (ActionRenderSelfCrossAdapterV4) smoke run on n06 (4x H100 NVL 95 GB). 10-video subset for fast plumbing validation. Tests: (1) pre-encoder mean-subtract on VAE latents; (2) temporal-mix middle conv with replicate-padding; (3) 3D positional encoding on render tokens; (4) self-attention transformer blocks over render tokens BEFORE cross-attention; (5) 1D positional encoding on action tokens before cross-attn. With 10 vids x 4 GPUs = ~3 steps/epoch, 5 epochs runs in minutes once cache builds.",
+
+  "model_path": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+  "dataset_base_path": "data_wan_1k",
+  "metadata_csv": "data_wan_1k/train_metadata_10.csv",
+  "output_dir": "./checkpoints/wan_render_drrobot_1k_v4_smoke",
+
+  "num_frames": 17,
+  "height": 240,
+  "width": 432,
+
+  "_precompute_cache_note": "Fresh probe-suffixed cache path so we don't clobber any training cache. ~50 MB once built.",
+  "precompute_cache_path": "data_wan_1k/precompute_cache_v4smoke_10vids_17f.pt",
+
+  "dataset_repeat": 1,
+  "num_epochs": 5,
+  "save_every_n_epochs": 2,
+
+  "learning_rate": 2e-05,
+  "gate_lr_multiplier": 1.0,
+  "lr_scheduler": "cosine_warmup",
+  "lr_warmup_steps": 200,
+  "lr_min_ratio": 0.0,
+  "weight_decay": 0.001,
+  "gradient_accumulation_steps": 1,
+  "max_grad_norm": 1.0,
+  "seed": 42,
+
+  "trainable": "render_only",
+  "unfreeze_last_n_blocks": 8,
+  "disable_render_gate": false,
+
+  "max_sequence_length": 256,
+  "mixed_precision": "bf16",
+  "num_workers": 4,
+  "log_every_n_steps": 1,
+
+  "condition_usage_sanity_samples": 0,
+  "render_dropout_prob": 0.1,
+
+  "_tracks_note": "Live changes inherited from main: TracksHead.mlp[-1] uses Kaiming-He init x 0.1 (model.py:201-208), loss is MSE not smooth_l1 (train_fsdp.py:1419 / train.py:1684), lambda=50 to make track contribution comparable to flow. max_query_points=640 uses ALL sparse AllTracker points per step (not subsampled).",
+  "lambda_tracks": 50.0,
+  "ref_frame": 1,
+  "max_query_points": 640,
+
+  "ignore_prompts": true,
+
+  "use_embodiment_adapter": false,
+  "embodiment_kwargs": null,
+  "legacy_render_variant": "v4",
+  "v4_adapter_kwargs": {
+    "action_dim": 8,
+    "hidden_dim": 512,
+    "num_heads": 8,
+    "num_self_blocks": 2,
+    "num_cross_blocks": 2,
+    "spatial_downsample": 2,
+    "ffn_mult": 4,
+    "max_action_frames": 128,
+    "max_t": 32,
+    "max_h": 32,
+    "max_w": 64
+  },
+
+  "_val_note": "Held-out 10-scene eval set (never in training). Val fires at end of epoch 1 (first val) and epoch 3. Cache: probe-suffixed so we don't disturb other runs.",
+  "val_metadata_csv": "data_wan_eval/eval_metadata.csv",
+  "val_dataset_base_path": "data_wan_eval",
+  "val_every_n_epochs": 2,
+  "val_timesteps": 4,
+  "val_precompute_cache_path": "data_wan_eval/precompute_cache_v4smoke_val_17f.pt",
+
+  "wandb_project": "wan_flow_drrobot",
+  "wandb_run_name": "1k_v4_smoke_10vids_4xH100NVL_n06",
+  "wandb_mode": "online"
+}
